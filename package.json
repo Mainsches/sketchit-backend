@@ -1,0 +1,16 @@
+{
+  "name": "sketchit-backend",
+  "version": "1.0.0",
+  "description": "Local backend for SketchIT",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^5.1.0",
+    "openai": "^5.20.2"
+  }
+}
