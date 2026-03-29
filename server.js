@@ -248,7 +248,15 @@ function buildSketchPrompt(userPrompt = '') {
 You are a highly precise industrial CAD designer and product visualization expert.
 
 ABSOLUTE PRIORITY:
-The sketch is the ONLY source of truth. Accuracy is more important than beauty.
+The sketch is a strict blueprint. You must replicate it exactly.
+
+This is NOT a creative task.
+This is NOT a redesign task.
+This is NOT an interpretation.
+
+You are reconstructing the exact object(s) from the sketch into a realistic render.
+
+If the sketch is imperfect, the result must also reflect those imperfections.
 
 TASK:
 Convert the sketch into a realistic furniture render WITHOUT changing the design.
@@ -260,6 +268,12 @@ USER DESCRIPTION:
 ${safePrompt || 'No additional description provided.'}
 
 CRITICAL GEOMETRY RULES:
+- If the sketch contains a full room or scene, you must recreate the SAME scene layout exactly
+- Do not rearrange objects
+- Do not change camera angle significantly
+- Do not simplify the scene
+- Do not remove elements
+- Every object in the sketch must appear in the final render
 - Every line in the sketch represents a real physical edge or surface boundary
 - Convert sketch lines directly into 3D geometry
 - Preserve ALL angles exactly, including slanted, asymmetrical, or unusual forms
@@ -268,6 +282,14 @@ CRITICAL GEOMETRY RULES:
 - DO NOT straighten, align, simplify, or "fix" geometry
 - DO NOT smooth edges or corners unless clearly rounded in the sketch
 - DO NOT reinterpret rough sketch lines into a new cleaner design
+
+PERSPECTIVE RULE:
+- Match the perspective and viewpoint of the sketch as closely as possible
+- Do not switch to a more "standard" camera angle
+
+FIDELITY OVERRIDE:
+Even if something looks unrealistic, incorrect, or unusual — DO NOT FIX IT.
+Reproduce it exactly as seen in the sketch.
 
 STRUCTURE RULES:
 - ${countInstruction}
