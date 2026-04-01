@@ -19,12 +19,19 @@ const openai = new OpenAI({
 const generations = new Map();
 const sessions = new Map();
 
+const FREE_DAILY_LIMIT = 2;
+const PREMIUM_DAILY_LIMIT = 50;
+
 function normalizeText(value = '') {
   return String(value).trim();
 }
 
 function createId(prefix = 'gen') {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function getUtcDayKey(timestamp = Date.now()) {
+  return new Date(timestamp).toISOString().slice(0, 10);
 }
 
 function textToNumber(value = '') {
@@ -50,7 +57,6 @@ function textToNumber(value = '') {
 
 function findNumberBeforeKeyword(prompt = '', keywords = []) {
   const text = prompt.toLowerCase();
-
   const numberWords = '(one|two|three|four|five|six|1|2|3|4|5|6|single|double)';
   const keywordGroup = keywords.join('|');
   const regex = new RegExp(`${numberWords}\\s+(${keywordGroup})`, 'i');
@@ -232,7 +238,7 @@ function extractNegativeHints(prompt = '') {
   return negatives.length ? negatives.join(' ') : 'Do not add unsupported extra details.';
 }
 
-function buildVariationInstruction(basePrompt = '', variationIndex = 0) {
+function buildVariationInstruction(_basePrompt = '', variationIndex = 0) {
   const seed = Math.floor(Math.random() * 1000000);
 
   if (!variationIndex) {
@@ -412,6 +418,25 @@ function getImageUrlFromResult(result) {
   return null;
 }
 
+function ensureSessionUsage(session) {
+  const todayKey = getUtcDayKey();
+
+  if (!session.usage) {
+    session.usage = {
+      dayKey: todayKey,
+      dailyCount: 0,
+      totalCount: 0,
+    };
+  }
+
+  if (session.usage.dayKey !== todayKey) {
+    session.usage.dayKey = todayKey;
+    session.usage.dailyCount = 0;
+  }
+
+  return session.usage;
+}
+
 function getOrCreateSession(sessionId) {
   const safeSessionId = sessionId || createId('session');
 
@@ -421,10 +446,94 @@ function getOrCreateSession(sessionId) {
       generationIds: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
+      isPremium: false,
+      usage: {
+        dayKey: getUtcDayKey(),
+        dailyCount: 0,
+        totalCount: 0,
+      },
     });
   }
 
-  return sessions.get(safeSessionId);
+  const session = sessions.get(safeSessionId);
+  ensureSessionUsage(session);
+  return session;
+}
+
+function getUsagePayload(session) {
+  const usage = ensureSessionUsage(session);
+  const dailyLimit = session.isPremium ? PREMIUM_DAILY_LIMIT : FREE_DAILY_LIMIT;
+  const remainingToday = Math.max(0, dailyLimit - usage.dailyCount);
+
+  return {
+    sessionId: session.id,
+    isPremium: Boolean(session.isPremium),
+    dailyCount: usage.dailyCount,
+    dailyLimit,
+    remainingToday,
+    totalCount: usage.totalCount,
+    resetDayKey: usage.dayKey,
+    canUsePremiumMode: Boolean(session.isPremium),
+    canUseVariations: Boolean(session.isPremium),
+  };
+}
+
+function jsonError(res, status, code, message, extra = {}) {
+  return res.status(status).json({
+    ok: false,
+    error: message,
+    code,
+    ...extra,
+  });
+}
+
+function validateUsageForGeneration(session, generationMode, isVariation = false) {
+  const usage = getUsagePayload(session);
+
+  if (!usage.isPremium && generationMode === 'premium') {
+    return {
+      allowed: false,
+      status: 403,
+      code: 'PREMIUM_MODE_REQUIRED',
+      message: 'Premium mode is only available for premium users.',
+      usage,
+    };
+  }
+
+  if (!usage.isPremium && isVariation) {
+    return {
+      allowed: false,
+      status: 403,
+      code: 'PREMIUM_VARIATION_REQUIRED',
+      message: 'Variations are only available for premium users.',
+      usage,
+    };
+  }
+
+  if (usage.remainingToday <= 0) {
+    return {
+      allowed: false,
+      status: 429,
+      code: 'DAILY_LIMIT_REACHED',
+      message: usage.isPremium
+        ? `You have used your ${PREMIUM_DAILY_LIMIT} premium images today.`
+        : `You have used your ${FREE_DAILY_LIMIT} free images today. Upgrade to premium for more generations and variations.`,
+      usage,
+    };
+  }
+
+  return {
+    allowed: true,
+    usage,
+  };
+}
+
+function registerUsage(session) {
+  const usage = ensureSessionUsage(session);
+  usage.dailyCount += 1;
+  usage.totalCount += 1;
+  session.updatedAt = Date.now();
+  return getUsagePayload(session);
 }
 
 async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'image/jpeg', generationMode = 'balanced', variationIndex = 0 }) {
@@ -464,13 +573,19 @@ async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'im
     }
 
     entry.status = 'done';
-    entry.imageUrl = imageUrl;
+    entry.imageDataUrl = imageUrl;
+    entry.imageBase64 = imageUrl.startsWith('data:image/') ? imageUrl.split(',')[1] : null;
     entry.updatedAt = Date.now();
     entry.completedAt = Date.now();
+    entry.finishedAt = new Date().toISOString();
+    entry.error = null;
   } catch (error) {
     entry.status = 'error';
-    entry.error = error?.message || 'Unknown generation error';
+    entry.error = {
+      message: error?.message || 'Unknown generation error',
+    };
     entry.updatedAt = Date.now();
+    entry.finishedAt = new Date().toISOString();
   }
 }
 
@@ -478,12 +593,31 @@ app.get('/', (_req, res) => {
   res.json({ ok: true, message: 'SketchIT backend is running' });
 });
 
+app.get('/usage/:sessionId', (req, res) => {
+  const session = getOrCreateSession(req.params.sessionId);
+  return res.json({
+    ok: true,
+    usage: getUsagePayload(session),
+  });
+});
+
+app.post('/session/:sessionId/premium', (req, res) => {
+  const session = getOrCreateSession(req.params.sessionId);
+  const isPremium = Boolean(req.body?.isPremium);
+  session.isPremium = isPremium;
+  session.updatedAt = Date.now();
+
+  return res.json({
+    ok: true,
+    usage: getUsagePayload(session),
+  });
+});
+
 app.get('/session/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-  const session = sessions.get(sessionId);
+  const session = sessions.get(req.params.sessionId);
 
   if (!session) {
-    return res.status(404).json({ error: 'Session not found.' });
+    return jsonError(res, 404, 'SESSION_NOT_FOUND', 'Session not found.');
   }
 
   const items = session.generationIds
@@ -491,7 +625,9 @@ app.get('/session/:sessionId', (req, res) => {
     .filter(Boolean);
 
   return res.json({
-    sessionId,
+    ok: true,
+    sessionId: session.id,
+    usage: getUsagePayload(session),
     items,
   });
 });
@@ -500,10 +636,13 @@ app.get('/generation/:id', (req, res) => {
   const entry = generations.get(req.params.id);
 
   if (!entry) {
-    return res.status(404).json({ error: 'Generation not found.' });
+    return jsonError(res, 404, 'GENERATION_NOT_FOUND', 'Generation not found.');
   }
 
-  return res.json(entry);
+  return res.json({
+    ok: true,
+    generation: entry,
+  });
 });
 
 app.post('/generation/start', async (req, res) => {
@@ -519,25 +658,41 @@ app.post('/generation/start', async (req, res) => {
     const safePrompt = normalizeText(prompt);
 
     if (!safePrompt && !imageBase64) {
-      return res.status(400).json({ error: 'Either prompt or imageBase64 is required.' });
+      return jsonError(res, 400, 'INVALID_INPUT', 'Either prompt or imageBase64 is required.');
     }
 
-    const generationId = createId('gen');
     const session = getOrCreateSession(sessionId);
+    const access = validateUsageForGeneration(session, generationMode, false);
+
+    if (!access.allowed) {
+      return jsonError(res, access.status, access.code, access.message, { usage: access.usage });
+    }
+
+    const usage = registerUsage(session);
+    const generationId = createId('gen');
 
     const entry = {
       id: generationId,
       sessionId: session.id,
+      sourceGenerationId: null,
       prompt: safePrompt,
-      type: imageBase64 ? 'sketch' : 'text',
+      type: 'base',
+      mimeType,
+      hasSketch: Boolean(imageBase64),
+      imageBase64: null,
+      imageDataUrl: null,
       generationMode,
-      imageUrl: null,
       status: 'pending',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      completedAt: null,
       error: null,
-      variationOf: null,
+      variationSeed: null,
+      variationIntent: null,
+      meta: {
+        promptUsed: safePrompt,
+      },
+      createdAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      updatedAt: Date.now(),
       variationIndex: 0,
     };
 
@@ -555,13 +710,12 @@ app.post('/generation/start', async (req, res) => {
     });
 
     return res.json({
-      generationId,
-      sessionId: session.id,
-      status: 'pending',
-      generationMode,
+      ok: true,
+      usage,
+      generation: entry,
     });
   } catch (error) {
-    return res.status(500).json({ error: error?.message || 'Failed to start generation.' });
+    return jsonError(res, 500, 'START_FAILED', error?.message || 'Failed to start generation.');
   }
 });
 
@@ -570,35 +724,50 @@ app.post('/generation/:id/variation', async (req, res) => {
     const base = generations.get(req.params.id);
 
     if (!base) {
-      return res.status(404).json({ error: 'Base generation not found.' });
+      return jsonError(res, 404, 'BASE_NOT_FOUND', 'Base generation not found.');
     }
 
+    const session = getOrCreateSession(base.sessionId);
     const {
       prompt = base.prompt,
-      imageBase64,
-      mimeType = 'image/jpeg',
       generationMode = base.generationMode || 'balanced',
+      variationIntent = 'alternate',
     } = req.body ?? {};
 
+    const access = validateUsageForGeneration(session, generationMode, true);
+
+    if (!access.allowed) {
+      return jsonError(res, access.status, access.code, access.message, { usage: access.usage });
+    }
+
+    const usage = registerUsage(session);
     const variationId = createId('gen');
-    const session = getOrCreateSession(base.sessionId);
     const siblingCount = session.generationIds
       .map((id) => generations.get(id))
-      .filter((item) => item?.variationOf === base.id).length;
+      .filter((item) => item?.sourceGenerationId === base.id).length;
 
     const entry = {
       id: variationId,
       sessionId: session.id,
+      sourceGenerationId: base.id,
       prompt: normalizeText(prompt),
-      type: imageBase64 || base.type === 'sketch' ? 'sketch' : 'text',
+      type: 'variation',
+      mimeType: base.mimeType || 'image/jpeg',
+      hasSketch: Boolean(base.hasSketch),
+      imageBase64: null,
+      imageDataUrl: null,
       generationMode,
-      imageUrl: null,
       status: 'pending',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      completedAt: null,
       error: null,
-      variationOf: base.id,
+      variationSeed: Math.floor(Math.random() * 1000000),
+      variationIntent,
+      meta: {
+        promptUsed: normalizeText(prompt),
+      },
+      createdAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      updatedAt: Date.now(),
       variationIndex: siblingCount + 1,
     };
 
@@ -609,21 +778,19 @@ app.post('/generation/:id/variation', async (req, res) => {
     runGeneration({
       generationId: variationId,
       prompt: entry.prompt,
-      imageBase64,
-      mimeType,
+      imageBase64: null,
+      mimeType: entry.mimeType,
       generationMode,
       variationIndex: entry.variationIndex,
     });
 
     return res.json({
-      generationId: variationId,
-      sessionId: session.id,
-      status: 'pending',
-      generationMode,
-      variationOf: base.id,
+      ok: true,
+      usage,
+      generation: entry,
     });
   } catch (error) {
-    return res.status(500).json({ error: error?.message || 'Failed to create variation.' });
+    return jsonError(res, 500, 'VARIATION_FAILED', error?.message || 'Failed to create variation.');
   }
 });
 
@@ -639,23 +806,30 @@ app.post('/generate', async (req, res) => {
     const safePrompt = normalizeText(prompt);
 
     if (!safePrompt && !imageBase64) {
-      return res.status(400).json({ error: 'Either prompt or imageBase64 is required.' });
+      return jsonError(res, 400, 'INVALID_INPUT', 'Either prompt or imageBase64 is required.');
     }
 
     const generationId = createId('legacy');
     generations.set(generationId, {
       id: generationId,
       sessionId: null,
+      sourceGenerationId: null,
       prompt: safePrompt,
-      type: imageBase64 ? 'sketch' : 'text',
+      type: 'base',
+      mimeType,
+      hasSketch: Boolean(imageBase64),
+      imageBase64: null,
+      imageDataUrl: null,
       generationMode,
-      imageUrl: null,
       status: 'pending',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      completedAt: null,
       error: null,
-      variationOf: null,
+      meta: {
+        promptUsed: safePrompt,
+      },
+      createdAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      updatedAt: Date.now(),
       variationIndex: 0,
     });
 
@@ -671,12 +845,17 @@ app.post('/generate', async (req, res) => {
     const entry = generations.get(generationId);
 
     if (entry?.status !== 'done') {
-      return res.status(500).json({ error: entry?.error || 'Generation failed.' });
+      return jsonError(res, 500, 'LEGACY_FAILED', entry?.error?.message || 'Generation failed.');
     }
 
-    return res.json({ imageUrl: entry.imageUrl, generationId, generationMode });
+    return res.json({
+      ok: true,
+      imageUrl: entry.imageDataUrl,
+      generationId,
+      generationMode,
+    });
   } catch (error) {
-    return res.status(500).json({ error: error?.message || 'Failed to generate image.' });
+    return jsonError(res, 500, 'LEGACY_FAILED', error?.message || 'Failed to generate image.');
   }
 });
 

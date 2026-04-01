@@ -1,11 +1,12 @@
 {
   "name": "sketchit-backend",
-  "version": "1.0.0",
-  "description": "Local backend for SketchIT",
+  "version": "1.1.0",
+  "description": "SketchIT backend with daily limits and premium-ready usage tracking",
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
