@@ -1,7 +1,7 @@
 {
   "name": "sketchit-backend",
-  "version": "1.0.0",
-  "description": "Local backend for SketchIT",
+  "version": "1.1.0",
+  "description": "SketchIT backend with session-based generation architecture",
   "main": "server.js",
   "type": "module",
   "scripts": {

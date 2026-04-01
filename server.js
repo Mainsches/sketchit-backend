@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -8,6 +9,10 @@ dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+const MODEL_NAME = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1';
+const IMAGE_SIZE = process.env.OPENAI_IMAGE_SIZE || '1024x1024';
+const MEMORY_LIMIT_PER_SESSION = Number(process.env.MEMORY_LIMIT_PER_SESSION || 100);
+const MEMORY_LIMIT_TOTAL = Number(process.env.MEMORY_LIMIT_TOTAL || 500);
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
@@ -16,8 +21,33 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+/**
+ * In-memory storage for now.
+ *
+ * This is intentionally shaped so it can later be moved to Redis/Postgres
+ * without changing the API contract too much.
+ */
+const generationStore = new Map();
+const sessionStore = new Map();
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function createId(prefix = 'gen') {
+  return `${prefix}_${crypto.randomUUID()}`;
+}
+
 function normalizeText(value = '') {
-  return String(value).trim();
+  return String(value || '').trim();
+}
+
+function clampString(value = '', maxLength = 4000) {
+  return String(value || '').slice(0, maxLength);
+}
+
+function randomSeed() {
+  return Math.floor(Math.random() * 1_000_000_000);
 }
 
 function textToNumber(value = '') {
@@ -43,15 +73,12 @@ function textToNumber(value = '') {
 
 function findNumberBeforeKeyword(prompt = '', keywords = []) {
   const text = prompt.toLowerCase();
-
   const numberWords = '(one|two|three|four|five|six|1|2|3|4|5|6|single|double)';
   const keywordGroup = keywords.join('|');
-
   const regex = new RegExp(`${numberWords}\\s+(${keywordGroup})`, 'i');
   const match = text.match(regex);
 
   if (!match) return null;
-
   return textToNumber(match[1]);
 }
 
@@ -213,7 +240,6 @@ function buildCountInstruction(prompt = '') {
   const doorCount = detectDoorCount(prompt);
   const drawerCount = detectDrawerCount(prompt);
   const shelfCount = detectShelfCount(prompt);
-
   const parts = [];
 
   if (doorCount) {
@@ -235,7 +261,11 @@ function buildCountInstruction(prompt = '') {
   return parts.join(' ');
 }
 
-function buildSketchPrompt(userPrompt = '') {
+function buildSketchPrompt({
+  userPrompt = '',
+  variationSeed = randomSeed(),
+  variationIntent = 'base',
+}) {
   const safePrompt = normalizeText(userPrompt);
   const material = detectMaterial(safePrompt);
   const furnitureType = detectFurnitureType(safePrompt);
@@ -266,6 +296,12 @@ ${furnitureType}
 
 USER DESCRIPTION:
 ${safePrompt || 'No additional description provided.'}
+
+VARIATION CONTROL:
+- Variation mode: ${variationIntent}
+- Variation seed: ${variationSeed}
+- If variation mode is not "base", create a distinct result while preserving the same core structure
+- Variation may affect material nuance, lighting nuance, camera distance nuance, and styling details only if they do not violate the sketch geometry
 
 CRITICAL GEOMETRY RULES:
 - If the sketch contains a full room or scene, you must recreate the SAME scene layout exactly
@@ -334,7 +370,11 @@ This must look like a real manufactured product that EXACTLY matches the sketch,
 `;
 }
 
-function buildTextOnlyPrompt(userPrompt = '') {
+function buildTextOnlyPrompt({
+  userPrompt = '',
+  variationSeed = randomSeed(),
+  variationIntent = 'base',
+}) {
   const safePrompt = normalizeText(userPrompt);
   const material = detectMaterial(safePrompt);
   const furnitureType = detectFurnitureType(safePrompt);
@@ -355,6 +395,12 @@ ${furnitureType}
 USER DESCRIPTION:
 ${safePrompt}
 
+VARIATION CONTROL:
+- Variation mode: ${variationIntent}
+- Variation seed: ${variationSeed}
+- If variation mode is not "base", keep the same core concept but make the result noticeably distinct
+- Variation may affect material nuance, proportions within the described concept, framing, and styling while staying realistic and faithful to the user description
+
 STRUCTURE RULES:
 - ${countInstruction}
 - Respect explicit object counts and segmentation if mentioned
@@ -372,6 +418,7 @@ DESIGN RULES:
 - Avoid fantasy or exaggerated shapes
 - Avoid decorative clutter
 - Use believable proportions
+- Make the design visually distinct from previous variants when variation mode is enabled
 
 RENDER RULES:
 - Soft studio lighting
@@ -386,16 +433,240 @@ Generate a realistic, clean, minimal furniture product render that fits the user
 `;
 }
 
+function buildOpenAiPrompt({ prompt, hasSketch, variationSeed, variationIntent }) {
+  if (hasSketch) {
+    return buildSketchPrompt({
+      userPrompt: prompt,
+      variationSeed,
+      variationIntent,
+    });
+  }
+
+  return buildTextOnlyPrompt({
+    userPrompt: prompt,
+    variationSeed,
+    variationIntent,
+  });
+}
+
+function ensureSession(sessionId) {
+  const safeSessionId = normalizeText(sessionId) || createId('session');
+
+  if (!sessionStore.has(safeSessionId)) {
+    sessionStore.set(safeSessionId, {
+      id: safeSessionId,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      generationIds: [],
+    });
+  }
+
+  return sessionStore.get(safeSessionId);
+}
+
+function sanitizeGenerationForClient(generation) {
+  if (!generation) return null;
+
+  return {
+    id: generation.id,
+    sessionId: generation.sessionId,
+    sourceGenerationId: generation.sourceGenerationId,
+    type: generation.type,
+    status: generation.status,
+    prompt: generation.prompt,
+    mimeType: generation.mimeType,
+    hasSketch: generation.hasSketch,
+    imageBase64: generation.imageBase64,
+    imageDataUrl: generation.imageBase64
+      ? `data:image/png;base64,${generation.imageBase64}`
+      : null,
+    error: generation.error,
+    variationSeed: generation.variationSeed,
+    variationIntent: generation.variationIntent,
+    meta: generation.meta,
+    createdAt: generation.createdAt,
+    startedAt: generation.startedAt,
+    finishedAt: generation.finishedAt,
+  };
+}
+
+function pushGenerationToSession(sessionId, generationId) {
+  const session = ensureSession(sessionId);
+  session.generationIds.push(generationId);
+  session.updatedAt = nowIso();
+
+  if (session.generationIds.length > MEMORY_LIMIT_PER_SESSION) {
+    const removeCount = session.generationIds.length - MEMORY_LIMIT_PER_SESSION;
+    const removedIds = session.generationIds.splice(0, removeCount);
+
+    for (const id of removedIds) {
+      generationStore.delete(id);
+    }
+  }
+}
+
+function trimGlobalMemory() {
+  if (generationStore.size <= MEMORY_LIMIT_TOTAL) {
+    return;
+  }
+
+  const entries = [...generationStore.values()].sort((a, b) => {
+    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+  });
+
+  while (entries.length > MEMORY_LIMIT_TOTAL) {
+    const oldest = entries.shift();
+    if (!oldest) break;
+    generationStore.delete(oldest.id);
+
+    const session = sessionStore.get(oldest.sessionId);
+    if (session) {
+      session.generationIds = session.generationIds.filter((id) => id !== oldest.id);
+    }
+  }
+}
+
+async function createImageWithOpenAI({ prompt, imageBase64, mimeType, variationSeed, variationIntent }) {
+  const finalPrompt = buildOpenAiPrompt({
+    prompt,
+    hasSketch: Boolean(imageBase64),
+    variationSeed,
+    variationIntent,
+  });
+
+  console.log('--- SketchIT prompt start ---');
+  console.log(finalPrompt);
+  console.log('--- SketchIT prompt end ---');
+
+  let result;
+
+  if (imageBase64) {
+    const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    const imageBuffer = Buffer.from(cleanBase64, 'base64');
+
+    const imageFile = await toFile(
+      imageBuffer,
+      mimeType === 'image/png' ? 'sketch.png' : 'sketch.jpg',
+      { type: mimeType }
+    );
+
+    result = await openai.images.edit({
+      model: MODEL_NAME,
+      image: imageFile,
+      prompt: finalPrompt,
+      size: IMAGE_SIZE,
+    });
+  } else {
+    result = await openai.images.generate({
+      model: MODEL_NAME,
+      prompt: finalPrompt,
+      size: IMAGE_SIZE,
+    });
+  }
+
+  const image = result?.data?.[0];
+
+  if (!image?.b64_json) {
+    throw new Error('No image returned from OpenAI.');
+  }
+
+  return {
+    imageBase64: image.b64_json,
+    promptUsed: finalPrompt,
+  };
+}
+
+async function processGeneration(generationId) {
+  const generation = generationStore.get(generationId);
+  if (!generation) return;
+
+  generation.status = 'processing';
+  generation.startedAt = nowIso();
+  generation.error = null;
+
+  try {
+    const result = await createImageWithOpenAI({
+      prompt: generation.prompt,
+      imageBase64: generation.inputImageBase64,
+      mimeType: generation.mimeType,
+      variationSeed: generation.variationSeed,
+      variationIntent: generation.variationIntent,
+    });
+
+    generation.status = 'done';
+    generation.imageBase64 = result.imageBase64;
+    generation.meta.promptUsed = result.promptUsed;
+    generation.finishedAt = nowIso();
+  } catch (error) {
+    console.error('FULL ERROR:', error);
+
+    generation.status = 'error';
+    generation.error = {
+      message: error?.message || 'Unknown server error',
+      details: error?.response?.data || null,
+    };
+    generation.finishedAt = nowIso();
+  }
+}
+
+function createGenerationRecord({
+  sessionId,
+  prompt,
+  imageBase64,
+  mimeType,
+  sourceGenerationId = null,
+  type = 'base',
+  variationIntent = 'base',
+}) {
+  const generation = {
+    id: createId('gen'),
+    sessionId,
+    sourceGenerationId,
+    type,
+    status: 'queued',
+    prompt: clampString(normalizeText(prompt), 4000),
+    mimeType: normalizeText(mimeType) || 'image/jpeg',
+    hasSketch: Boolean(imageBase64),
+    inputImageBase64: imageBase64 || null,
+    imageBase64: null,
+    error: null,
+    variationSeed: randomSeed(),
+    variationIntent,
+    meta: {},
+    createdAt: nowIso(),
+    startedAt: null,
+    finishedAt: null,
+  };
+
+  generationStore.set(generation.id, generation);
+  pushGenerationToSession(sessionId, generation.id);
+  trimGlobalMemory();
+
+  return generation;
+}
+
 app.get('/', (_req, res) => {
-  res.json({ ok: true, message: 'SketchIT backend is running' });
+  res.json({
+    ok: true,
+    message: 'SketchIT backend is running',
+    model: MODEL_NAME,
+    imageSize: IMAGE_SIZE,
+    endpoints: [
+      'POST /generation/start',
+      'GET /generation/:id',
+      'POST /generation/:id/variation',
+      'GET /session/:sessionId',
+    ],
+  });
 });
 
-app.post('/generate', async (req, res) => {
+app.post('/generation/start', async (req, res) => {
   try {
     const {
       prompt,
       imageBase64,
       mimeType = 'image/jpeg',
+      sessionId,
     } = req.body ?? {};
 
     const safePrompt = normalizeText(prompt);
@@ -406,58 +677,175 @@ app.post('/generate', async (req, res) => {
       });
     }
 
-    let result;
+    const session = ensureSession(sessionId);
 
-    if (imageBase64) {
-      const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
-      const imageBuffer = Buffer.from(cleanBase64, 'base64');
+    const generation = createGenerationRecord({
+      sessionId: session.id,
+      prompt: safePrompt,
+      imageBase64,
+      mimeType,
+      type: 'base',
+      variationIntent: 'base',
+    });
 
-      const imageFile = await toFile(
-        imageBuffer,
-        mimeType === 'image/png' ? 'sketch.png' : 'sketch.jpg',
-        { type: mimeType }
-      );
+    processGeneration(generation.id).catch((error) => {
+      console.error('Background generation crash:', error);
+    });
 
-      const finalPrompt = buildSketchPrompt(safePrompt);
-
-      console.log('Using sketch-based prompt...');
-      console.log(finalPrompt);
-
-      result = await openai.images.edit({
-        model: 'gpt-image-1',
-        image: imageFile,
-        prompt: finalPrompt,
-        size: '1024x1024',
-      });
-    } else {
-      const finalPrompt = buildTextOnlyPrompt(safePrompt);
-
-      console.log('Using text-only prompt...');
-      console.log(finalPrompt);
-
-      result = await openai.images.generate({
-        model: 'gpt-image-1',
-        prompt: finalPrompt,
-        size: '1024x1024',
-      });
-    }
-
-    const image = result?.data?.[0];
-
-    if (!image || !image.b64_json) {
-      return res.status(500).json({
-        error: 'No image returned from OpenAI.',
-        debugKeys: Object.keys(result || {}),
-      });
-    }
-
-    res.json({
-      imageBase64: image.b64_json,
+    return res.status(202).json({
+      ok: true,
+      generation: sanitizeGenerationForClient(generation),
     });
   } catch (error) {
-    console.error('FULL ERROR:', error);
+    console.error('START GENERATION ERROR:', error);
 
-    res.status(500).json({
+    return res.status(500).json({
+      error: error?.message || 'Unknown server error',
+      details: error?.response?.data || null,
+    });
+  }
+});
+
+app.get('/generation/:id', async (req, res) => {
+  const generation = generationStore.get(req.params.id);
+
+  if (!generation) {
+    return res.status(404).json({
+      error: 'Generation not found.',
+    });
+  }
+
+  return res.json({
+    ok: true,
+    generation: sanitizeGenerationForClient(generation),
+  });
+});
+
+app.post('/generation/:id/variation', async (req, res) => {
+  try {
+    const sourceGeneration = generationStore.get(req.params.id);
+
+    if (!sourceGeneration) {
+      return res.status(404).json({
+        error: 'Source generation not found.',
+      });
+    }
+
+    const {
+      prompt,
+      variationIntent = 'alternate',
+    } = req.body ?? {};
+
+    const variationPrompt = normalizeText(prompt) || sourceGeneration.prompt;
+
+    const variation = createGenerationRecord({
+      sessionId: sourceGeneration.sessionId,
+      prompt: variationPrompt,
+      imageBase64: sourceGeneration.inputImageBase64,
+      mimeType: sourceGeneration.mimeType,
+      sourceGenerationId: sourceGeneration.id,
+      type: 'variation',
+      variationIntent,
+    });
+
+    processGeneration(variation.id).catch((error) => {
+      console.error('Background variation crash:', error);
+    });
+
+    return res.status(202).json({
+      ok: true,
+      generation: sanitizeGenerationForClient(variation),
+    });
+  } catch (error) {
+    console.error('VARIATION ERROR:', error);
+
+    return res.status(500).json({
+      error: error?.message || 'Unknown server error',
+      details: error?.response?.data || null,
+    });
+  }
+});
+
+app.get('/session/:sessionId', (req, res) => {
+  const session = sessionStore.get(req.params.sessionId);
+
+  if (!session) {
+    return res.status(404).json({
+      error: 'Session not found.',
+    });
+  }
+
+  const generations = session.generationIds
+    .map((id) => generationStore.get(id))
+    .filter(Boolean)
+    .map((item) => sanitizeGenerationForClient(item));
+
+  return res.json({
+    ok: true,
+    session: {
+      id: session.id,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      generations,
+    },
+  });
+});
+
+/**
+ * Temporary compatibility route so your current frontend does not break instantly.
+ *
+ * Later we remove this once the app switches to:
+ * - POST /generation/start
+ * - GET /generation/:id
+ */
+app.post('/generate', async (req, res) => {
+  try {
+    const { prompt, imageBase64, mimeType = 'image/jpeg', sessionId } = req.body ?? {};
+    const safePrompt = normalizeText(prompt);
+
+    if (!safePrompt && !imageBase64) {
+      return res.status(400).json({
+        error: 'Either prompt or imageBase64 is required.',
+      });
+    }
+
+    const session = ensureSession(sessionId);
+
+    const generation = createGenerationRecord({
+      sessionId: session.id,
+      prompt: safePrompt,
+      imageBase64,
+      mimeType,
+      type: 'base',
+      variationIntent: 'base',
+    });
+
+    await processGeneration(generation.id);
+
+    const finished = generationStore.get(generation.id);
+
+    if (!finished) {
+      return res.status(500).json({
+        error: 'Generation disappeared unexpectedly.',
+      });
+    }
+
+    if (finished.status === 'error') {
+      return res.status(500).json({
+        error: finished.error?.message || 'Unknown server error',
+        details: finished.error?.details || null,
+      });
+    }
+
+    return res.json({
+      imageBase64: finished.imageBase64,
+      generationId: finished.id,
+      sessionId: finished.sessionId,
+    });
+  } catch (error) {
+    console.error('LEGACY GENERATE ERROR:', error);
+
+    return res.status(500).json({
       error: error?.message || 'Unknown server error',
       details: error?.response?.data || null,
     });
