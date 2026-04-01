@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -9,10 +8,6 @@ dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 3000;
-const MODEL_NAME = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1';
-const IMAGE_SIZE = process.env.OPENAI_IMAGE_SIZE || '1024x1024';
-const MEMORY_LIMIT_PER_SESSION = Number(process.env.MEMORY_LIMIT_PER_SESSION || 100);
-const MEMORY_LIMIT_TOTAL = Number(process.env.MEMORY_LIMIT_TOTAL || 500);
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
@@ -21,33 +16,15 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-/**
- * In-memory storage for now.
- *
- * This is intentionally shaped so it can later be moved to Redis/Postgres
- * without changing the API contract too much.
- */
-const generationStore = new Map();
-const sessionStore = new Map();
+const generations = new Map();
+const sessions = new Map();
 
-function nowIso() {
-  return new Date().toISOString();
+function normalizeText(value = '') {
+  return String(value).trim();
 }
 
 function createId(prefix = 'gen') {
-  return `${prefix}_${crypto.randomUUID()}`;
-}
-
-function normalizeText(value = '') {
-  return String(value || '').trim();
-}
-
-function clampString(value = '', maxLength = 4000) {
-  return String(value || '').slice(0, maxLength);
-}
-
-function randomSeed() {
-  return Math.floor(Math.random() * 1_000_000_000);
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function textToNumber(value = '') {
@@ -73,12 +50,14 @@ function textToNumber(value = '') {
 
 function findNumberBeforeKeyword(prompt = '', keywords = []) {
   const text = prompt.toLowerCase();
+
   const numberWords = '(one|two|three|four|five|six|1|2|3|4|5|6|single|double)';
   const keywordGroup = keywords.join('|');
   const regex = new RegExp(`${numberWords}\\s+(${keywordGroup})`, 'i');
   const match = text.match(regex);
 
   if (!match) return null;
+
   return textToNumber(match[1]);
 }
 
@@ -91,38 +70,17 @@ function detectDrawerCount(prompt = '') {
 }
 
 function detectShelfCount(prompt = '') {
-  return findNumberBeforeKeyword(prompt, [
-    'shelf',
-    'shelves',
-    'compartment',
-    'compartments',
-    'section',
-    'sections',
-  ]);
+  return findNumberBeforeKeyword(prompt, ['shelf', 'shelves', 'compartment', 'compartments', 'section', 'sections']);
 }
 
 function detectMaterial(prompt = '') {
   const text = prompt.toLowerCase();
 
-  if (
-    text.includes('oak') ||
-    text.includes('wood') ||
-    text.includes('wooden') ||
-    text.includes('walnut') ||
-    text.includes('ash wood') ||
-    text.includes('grey wood') ||
-    text.includes('gray wood')
-  ) {
+  if (text.includes('oak') || text.includes('wood') || text.includes('wooden') || text.includes('walnut') || text.includes('ash wood') || text.includes('grey wood') || text.includes('gray wood')) {
     return 'wood';
   }
 
-  if (
-    text.includes('metal') ||
-    text.includes('steel') ||
-    text.includes('aluminium') ||
-    text.includes('aluminum') ||
-    text.includes('iron')
-  ) {
+  if (text.includes('metal') || text.includes('steel') || text.includes('aluminium') || text.includes('aluminum') || text.includes('iron')) {
     return 'metal';
   }
 
@@ -130,12 +88,7 @@ function detectMaterial(prompt = '') {
     return 'glass';
   }
 
-  if (
-    text.includes('fabric') ||
-    text.includes('textile') ||
-    text.includes('upholstered') ||
-    text.includes('cushion')
-  ) {
+  if (text.includes('fabric') || text.includes('textile') || text.includes('upholstered') || text.includes('cushion')) {
     return 'fabric';
   }
 
@@ -145,20 +98,7 @@ function detectMaterial(prompt = '') {
 function detectColors(prompt = '') {
   const text = prompt.toLowerCase();
   const colors = [];
-
-  const knownColors = [
-    'white',
-    'black',
-    'grey',
-    'gray',
-    'brown',
-    'beige',
-    'oak',
-    'walnut',
-    'green',
-    'blue',
-    'red',
-  ];
+  const knownColors = ['white', 'black', 'grey', 'gray', 'brown', 'beige', 'oak', 'walnut', 'green', 'blue', 'red'];
 
   for (const color of knownColors) {
     if (text.includes(color)) {
@@ -167,6 +107,36 @@ function detectColors(prompt = '') {
   }
 
   return [...new Set(colors)];
+}
+
+function detectStyleHints(prompt = '') {
+  const text = prompt.toLowerCase();
+  const styles = [];
+
+  if (text.includes('minimal')) styles.push('minimal');
+  if (text.includes('modern')) styles.push('modern');
+  if (text.includes('scandinavian')) styles.push('scandinavian');
+  if (text.includes('industrial')) styles.push('industrial');
+  if (text.includes('premium') || text.includes('luxury')) styles.push('premium');
+
+  return styles;
+}
+
+function detectFurnitureType(prompt = '') {
+  const text = prompt.toLowerCase();
+
+  if (text.includes('chair')) return 'chair';
+  if (text.includes('table')) return 'table';
+  if (text.includes('cabinet')) return 'cabinet';
+  if (text.includes('closet')) return 'closet';
+  if (text.includes('wardrobe')) return 'wardrobe';
+  if (text.includes('shelf')) return 'shelf';
+  if (text.includes('sideboard')) return 'sideboard';
+  if (text.includes('stool')) return 'stool';
+  if (text.includes('bench')) return 'bench';
+  if (text.includes('desk')) return 'desk';
+
+  return 'general furniture object';
 }
 
 function buildColorInstruction(colors = []) {
@@ -192,15 +162,12 @@ function buildMaterialInstruction(material, prompt = '') {
     if (text.includes('grey wood') || text.includes('gray wood')) {
       return 'Use realistic grey wood as the main material and preserve a believable wood texture.';
     }
-
     if (text.includes('oak')) {
       return 'Use realistic oak wood as the main material with believable grain and a premium furniture finish.';
     }
-
     if (text.includes('walnut')) {
       return 'Use realistic walnut wood as the main material with rich natural grain and a premium finish.';
     }
-
     return 'Use realistic wood as the main material with believable grain, clean edges, and a manufacturable finish.';
   }
 
@@ -219,23 +186,6 @@ function buildMaterialInstruction(material, prompt = '') {
   return 'Use neutral realistic furniture materials that fit the sketch naturally without redesigning the object.';
 }
 
-function detectFurnitureType(prompt = '') {
-  const text = prompt.toLowerCase();
-
-  if (text.includes('chair')) return 'chair';
-  if (text.includes('table')) return 'table';
-  if (text.includes('cabinet')) return 'cabinet';
-  if (text.includes('closet')) return 'closet';
-  if (text.includes('wardrobe')) return 'wardrobe';
-  if (text.includes('shelf')) return 'shelf';
-  if (text.includes('sideboard')) return 'sideboard';
-  if (text.includes('stool')) return 'stool';
-  if (text.includes('bench')) return 'bench';
-  if (text.includes('desk')) return 'desk';
-
-  return 'general furniture object';
-}
-
 function buildCountInstruction(prompt = '') {
   const doorCount = detectDoorCount(prompt);
   const drawerCount = detectDrawerCount(prompt);
@@ -245,11 +195,9 @@ function buildCountInstruction(prompt = '') {
   if (doorCount) {
     parts.push(`The object must have exactly ${doorCount} visible door${doorCount > 1 ? 's' : ''}.`);
   }
-
   if (drawerCount) {
     parts.push(`The object must have exactly ${drawerCount} visible drawer${drawerCount > 1 ? 's' : ''}.`);
   }
-
   if (shelfCount) {
     parts.push(`The object must have exactly ${shelfCount} visible shelf/shelves or compartment sections if clearly implied by the design.`);
   }
@@ -261,11 +209,64 @@ function buildCountInstruction(prompt = '') {
   return parts.join(' ');
 }
 
-function buildSketchPrompt({
-  userPrompt = '',
-  variationSeed = randomSeed(),
-  variationIntent = 'base',
-}) {
+function buildStyleInstruction(prompt = '') {
+  const styles = detectStyleHints(prompt);
+
+  if (!styles.length) {
+    return 'Keep the design clean, believable, and commercially realistic.';
+  }
+
+  return `Style direction from the user: ${styles.join(', ')}. Apply only if it does not conflict with the sketch structure.`;
+}
+
+function extractNegativeHints(prompt = '') {
+  const text = prompt.toLowerCase();
+  const negatives = [];
+
+  if (text.includes('no handles')) negatives.push('Do not add handles.');
+  if (text.includes('without handles')) negatives.push('Do not add handles.');
+  if (text.includes('no legs')) negatives.push('Do not add visible legs unless clearly present.');
+  if (text.includes('wall mounted')) negatives.push('Do not add floor-standing support unless clearly present.');
+  if (text.includes('floating')) negatives.push('Keep the design visually floating or wall-mounted if implied.');
+
+  return negatives.length ? negatives.join(' ') : 'Do not add unsupported extra details.';
+}
+
+function buildVariationInstruction(basePrompt = '', variationIndex = 0) {
+  const seed = Math.floor(Math.random() * 1000000);
+
+  if (!variationIndex) {
+    return `Variation seed: ${seed}.`;
+  }
+
+  return `Create a clearly distinct alternative while preserving the same core object idea. Variation index: ${variationIndex}. Variation seed: ${seed}. Change visible proportions, material treatment, edge language, panel layout emphasis, or leg/support details if compatible with the request.`;
+}
+
+function buildGenerationMode(mode = 'balanced') {
+  if (mode === 'fast') {
+    return {
+      label: 'fast',
+      renderInstruction: 'Prioritize a clean result and low latency. Keep composition simple and direct.',
+      apiSize: '1024x1024',
+    };
+  }
+
+  if (mode === 'premium') {
+    return {
+      label: 'premium',
+      renderInstruction: 'Prioritize richer material detail and a stronger premium product-photography feel.',
+      apiSize: '1024x1024',
+    };
+  }
+
+  return {
+    label: 'balanced',
+    renderInstruction: 'Balance speed, cost, and visual quality. Keep the result clean and commercially polished.',
+    apiSize: '1024x1024',
+  };
+}
+
+function buildSketchPrompt({ userPrompt = '', generationMode = 'balanced', variationIndex = 0 } = {}) {
   const safePrompt = normalizeText(userPrompt);
   const material = detectMaterial(safePrompt);
   const furnitureType = detectFurnitureType(safePrompt);
@@ -273,108 +274,71 @@ function buildSketchPrompt({
   const colors = detectColors(safePrompt);
   const colorInstruction = buildColorInstruction(colors);
   const countInstruction = buildCountInstruction(safePrompt);
+  const styleInstruction = buildStyleInstruction(safePrompt);
+  const negativeHints = extractNegativeHints(safePrompt);
+  const variationInstruction = buildVariationInstruction(safePrompt, variationIndex);
+  const mode = buildGenerationMode(generationMode);
 
   return `
-You are a highly precise industrial CAD designer and product visualization expert.
+You are a highly precise industrial designer, furniture engineer, and product visualization expert.
 
-ABSOLUTE PRIORITY:
-The sketch is a strict blueprint. You must replicate it exactly.
+PRIMARY GOAL:
+Reconstruct the uploaded sketch into a realistic product render with maximum structural fidelity.
 
-This is NOT a creative task.
-This is NOT a redesign task.
-This is NOT an interpretation.
-
-You are reconstructing the exact object(s) from the sketch into a realistic render.
-
-If the sketch is imperfect, the result must also reflect those imperfections.
-
-TASK:
-Convert the sketch into a realistic furniture render WITHOUT changing the design.
-
-OBJECT TYPE:
-${furnitureType}
+TASK TYPE:
+Sketch-to-image reconstruction for a ${furnitureType}.
 
 USER DESCRIPTION:
 ${safePrompt || 'No additional description provided.'}
 
-VARIATION CONTROL:
-- Variation mode: ${variationIntent}
-- Variation seed: ${variationSeed}
-- If variation mode is not "base", create a distinct result while preserving the same core structure
-- Variation may affect material nuance, lighting nuance, camera distance nuance, and styling details only if they do not violate the sketch geometry
+GEOMETRY PRIORITY RULES:
+- The sketch is the main source of truth
+- Preserve the same overall silhouette, proportions, segmentation, and perspective
+- Every visible line likely represents a meaningful physical edge, panel split, or boundary
+- Do not redesign the object
+- Do not simplify unusual shapes
+- Do not remove asymmetry if present
+- Do not replace the concept with a more generic furniture design
 
-CRITICAL GEOMETRY RULES:
-- If the sketch contains a full room or scene, you must recreate the SAME scene layout exactly
-- Do not rearrange objects
-- Do not change camera angle significantly
-- Do not simplify the scene
-- Do not remove elements
-- Every object in the sketch must appear in the final render
-- Every line in the sketch represents a real physical edge or surface boundary
-- Convert sketch lines directly into 3D geometry
-- Preserve ALL angles exactly, including slanted, asymmetrical, or unusual forms
-- Preserve ALL proportions exactly
-- Preserve the same segmentation and part layout
-- DO NOT straighten, align, simplify, or "fix" geometry
-- DO NOT smooth edges or corners unless clearly rounded in the sketch
-- DO NOT reinterpret rough sketch lines into a new cleaner design
-
-PERSPECTIVE RULE:
-- Match the perspective and viewpoint of the sketch as closely as possible
-- Do not switch to a more "standard" camera angle
-
-FIDELITY OVERRIDE:
-Even if something looks unrealistic, incorrect, or unusual — DO NOT FIX IT.
-Reproduce it exactly as seen in the sketch.
-
-STRUCTURE RULES:
+COUNT AND STRUCTURE RULES:
 - ${countInstruction}
-- Every visible panel, door, drawer, section, support, side wall, and divider in the sketch must remain in the final object
-- Do not merge segments
-- Do not add new segments
-- Do not shift spacing
-- Count accuracy is critical
+- Preserve visible panels, dividers, side walls, supports, and openings
+- Do not invent extra compartments or decorative elements
 
-ANTI-CREATIVE RULES:
-- DO NOT redesign the object
-- DO NOT improve the design
-- DO NOT make it more aesthetic than the sketch
-- DO NOT add missing features based on your assumptions
-- DO NOT remove imperfections if they define the structure
-- DO NOT use "design intelligence" to reinterpret the object
+STYLE RULES:
+- ${styleInstruction}
+- ${negativeHints}
+- If the sketch is rough, preserve the structural intention instead of beautifying it into a different design
 
 MATERIAL RULES:
 - ${materialInstruction}
 
 COLOR RULES:
 - ${colorInstruction}
-- Keep color blocking simple and structurally faithful
-- If the sketch implies separate panels, maintain those panel color boundaries consistently
 
 REALISM RULES:
-- The object must look manufacturable
-- Use realistic join logic only if it does not alter the visible shape
-- Respect how furniture is actually built without changing the sketch design
+- The result must look manufacturable
+- Use believable furniture construction logic only if it does not alter the visible design
+- Keep join logic clean and realistic
 
 RENDER RULES:
-- Neutral studio lighting
-- Clean neutral background
-- Product render style
-- No decoration
-- No surrounding environment
-- High material detail
-- Geometry faithfulness is more important than visual beauty
+- Neutral background
+- Product render / product photo look
+- Soft controlled studio lighting
+- Clean composition
+- Strong edge readability
+- Realistic materials
+- ${mode.renderInstruction}
+
+VARIATION CONTROL:
+- ${variationInstruction}
 
 FINAL RULE:
-This must look like a real manufactured product that EXACTLY matches the sketch, not an interpretation of it.
+This must look like a real manufactured product that closely matches the uploaded sketch, not a loose interpretation.
 `;
 }
 
-function buildTextOnlyPrompt({
-  userPrompt = '',
-  variationSeed = randomSeed(),
-  variationIntent = 'base',
-}) {
+function buildTextOnlyPrompt({ userPrompt = '', generationMode = 'balanced', variationIndex = 0 } = {}) {
   const safePrompt = normalizeText(userPrompt);
   const material = detectMaterial(safePrompt);
   const furnitureType = detectFurnitureType(safePrompt);
@@ -382,12 +346,16 @@ function buildTextOnlyPrompt({
   const colors = detectColors(safePrompt);
   const colorInstruction = buildColorInstruction(colors);
   const countInstruction = buildCountInstruction(safePrompt);
+  const styleInstruction = buildStyleInstruction(safePrompt);
+  const negativeHints = extractNegativeHints(safePrompt);
+  const variationInstruction = buildVariationInstruction(safePrompt, variationIndex);
+  const mode = buildGenerationMode(generationMode);
 
   return `
-You are a professional industrial designer and furniture visualization expert.
+You are a professional industrial designer and product visualization expert.
 
 TASK:
-Create a high-quality realistic furniture product render based on the user's text description.
+Create one realistic furniture product render from the user's description.
 
 OBJECT TYPE:
 ${furnitureType}
@@ -395,16 +363,19 @@ ${furnitureType}
 USER DESCRIPTION:
 ${safePrompt}
 
-VARIATION CONTROL:
-- Variation mode: ${variationIntent}
-- Variation seed: ${variationSeed}
-- If variation mode is not "base", keep the same core concept but make the result noticeably distinct
-- Variation may affect material nuance, proportions within the described concept, framing, and styling while staying realistic and faithful to the user description
+INTERPRETATION PRIORITY:
+- Respect the user's explicit structure and layout instructions
+- Prefer one strong, coherent object over multiple objects
+- Keep the object manufacturable and believable
 
 STRUCTURE RULES:
 - ${countInstruction}
-- Respect explicit object counts and segmentation if mentioned
-- Do not invent extra doors, drawers, shelves, sections, or supports
+- Do not invent extra doors, drawers, shelves, or supports unless clearly implied
+
+STYLE RULES:
+- ${styleInstruction}
+- ${negativeHints}
+- Keep the design commercially realistic, clean, and premium
 
 MATERIAL RULES:
 - ${materialInstruction}
@@ -412,252 +383,127 @@ MATERIAL RULES:
 COLOR RULES:
 - ${colorInstruction}
 
-DESIGN RULES:
-- Create one clear furniture object
-- Keep the design minimal, realistic, and premium
-- Avoid fantasy or exaggerated shapes
-- Avoid decorative clutter
-- Use believable proportions
-- Make the design visually distinct from previous variants when variation mode is enabled
-
 RENDER RULES:
-- Soft studio lighting
+- Product photography style
 - Neutral clean background
+- Soft studio lighting
 - Realistic shadows
-- Product photography look
-- High material detail
+- High edge clarity
 - Clean composition
+- ${mode.renderInstruction}
 
-FINAL INSTRUCTION:
-Generate a realistic, clean, minimal furniture product render that fits the user description closely.
+VARIATION CONTROL:
+- ${variationInstruction}
+
+FINAL RULE:
+Generate a realistic, clean, minimal product render that follows the user description closely and looks production-ready.
 `;
 }
 
-function buildOpenAiPrompt({ prompt, hasSketch, variationSeed, variationIntent }) {
-  if (hasSketch) {
-    return buildSketchPrompt({
-      userPrompt: prompt,
-      variationSeed,
-      variationIntent,
-    });
+function getImageUrlFromResult(result) {
+  if (Array.isArray(result?.data) && result.data[0]?.url) {
+    return result.data[0].url;
   }
 
-  return buildTextOnlyPrompt({
-    userPrompt: prompt,
-    variationSeed,
-    variationIntent,
-  });
+  if (Array.isArray(result?.data) && result.data[0]?.b64_json) {
+    return `data:image/png;base64,${result.data[0].b64_json}`;
+  }
+
+  return null;
 }
 
-function ensureSession(sessionId) {
-  const safeSessionId = normalizeText(sessionId) || createId('session');
+function getOrCreateSession(sessionId) {
+  const safeSessionId = sessionId || createId('session');
 
-  if (!sessionStore.has(safeSessionId)) {
-    sessionStore.set(safeSessionId, {
+  if (!sessions.has(safeSessionId)) {
+    sessions.set(safeSessionId, {
       id: safeSessionId,
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
       generationIds: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
     });
   }
 
-  return sessionStore.get(safeSessionId);
+  return sessions.get(safeSessionId);
 }
 
-function sanitizeGenerationForClient(generation) {
-  if (!generation) return null;
-
-  return {
-    id: generation.id,
-    sessionId: generation.sessionId,
-    sourceGenerationId: generation.sourceGenerationId,
-    type: generation.type,
-    status: generation.status,
-    prompt: generation.prompt,
-    mimeType: generation.mimeType,
-    hasSketch: generation.hasSketch,
-    imageBase64: generation.imageBase64,
-    imageDataUrl: generation.imageBase64
-      ? `data:image/png;base64,${generation.imageBase64}`
-      : null,
-    error: generation.error,
-    variationSeed: generation.variationSeed,
-    variationIntent: generation.variationIntent,
-    meta: generation.meta,
-    createdAt: generation.createdAt,
-    startedAt: generation.startedAt,
-    finishedAt: generation.finishedAt,
-  };
-}
-
-function pushGenerationToSession(sessionId, generationId) {
-  const session = ensureSession(sessionId);
-  session.generationIds.push(generationId);
-  session.updatedAt = nowIso();
-
-  if (session.generationIds.length > MEMORY_LIMIT_PER_SESSION) {
-    const removeCount = session.generationIds.length - MEMORY_LIMIT_PER_SESSION;
-    const removedIds = session.generationIds.splice(0, removeCount);
-
-    for (const id of removedIds) {
-      generationStore.delete(id);
-    }
-  }
-}
-
-function trimGlobalMemory() {
-  if (generationStore.size <= MEMORY_LIMIT_TOTAL) {
-    return;
-  }
-
-  const entries = [...generationStore.values()].sort((a, b) => {
-    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
-  });
-
-  while (entries.length > MEMORY_LIMIT_TOTAL) {
-    const oldest = entries.shift();
-    if (!oldest) break;
-    generationStore.delete(oldest.id);
-
-    const session = sessionStore.get(oldest.sessionId);
-    if (session) {
-      session.generationIds = session.generationIds.filter((id) => id !== oldest.id);
-    }
-  }
-}
-
-async function createImageWithOpenAI({ prompt, imageBase64, mimeType, variationSeed, variationIntent }) {
-  const finalPrompt = buildOpenAiPrompt({
-    prompt,
-    hasSketch: Boolean(imageBase64),
-    variationSeed,
-    variationIntent,
-  });
-
-  console.log('--- SketchIT prompt start ---');
-  console.log(finalPrompt);
-  console.log('--- SketchIT prompt end ---');
-
-  let result;
-
-  if (imageBase64) {
-    const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
-    const imageBuffer = Buffer.from(cleanBase64, 'base64');
-
-    const imageFile = await toFile(
-      imageBuffer,
-      mimeType === 'image/png' ? 'sketch.png' : 'sketch.jpg',
-      { type: mimeType }
-    );
-
-    result = await openai.images.edit({
-      model: MODEL_NAME,
-      image: imageFile,
-      prompt: finalPrompt,
-      size: IMAGE_SIZE,
-    });
-  } else {
-    result = await openai.images.generate({
-      model: MODEL_NAME,
-      prompt: finalPrompt,
-      size: IMAGE_SIZE,
-    });
-  }
-
-  const image = result?.data?.[0];
-
-  if (!image?.b64_json) {
-    throw new Error('No image returned from OpenAI.');
-  }
-
-  return {
-    imageBase64: image.b64_json,
-    promptUsed: finalPrompt,
-  };
-}
-
-async function processGeneration(generationId) {
-  const generation = generationStore.get(generationId);
-  if (!generation) return;
-
-  generation.status = 'processing';
-  generation.startedAt = nowIso();
-  generation.error = null;
+async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'image/jpeg', generationMode = 'balanced', variationIndex = 0 }) {
+  const entry = generations.get(generationId);
+  if (!entry) return;
 
   try {
-    const result = await createImageWithOpenAI({
-      prompt: generation.prompt,
-      imageBase64: generation.inputImageBase64,
-      mimeType: generation.mimeType,
-      variationSeed: generation.variationSeed,
-      variationIntent: generation.variationIntent,
-    });
+    entry.status = 'processing';
+    entry.updatedAt = Date.now();
 
-    generation.status = 'done';
-    generation.imageBase64 = result.imageBase64;
-    generation.meta.promptUsed = result.promptUsed;
-    generation.finishedAt = nowIso();
+    let result;
+    const mode = buildGenerationMode(generationMode);
+
+    if (imageBase64) {
+      const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      const imageBuffer = Buffer.from(cleanBase64, 'base64');
+      const imageFile = await toFile(imageBuffer, mimeType === 'image/png' ? 'sketch.png' : 'sketch.jpg', { type: mimeType });
+
+      result = await openai.images.edit({
+        model: 'gpt-image-1',
+        image: imageFile,
+        prompt: buildSketchPrompt({ userPrompt: prompt, generationMode, variationIndex }),
+        size: mode.apiSize,
+      });
+    } else {
+      result = await openai.images.generate({
+        model: 'gpt-image-1',
+        prompt: buildTextOnlyPrompt({ userPrompt: prompt, generationMode, variationIndex }),
+        size: mode.apiSize,
+      });
+    }
+
+    const imageUrl = getImageUrlFromResult(result);
+
+    if (!imageUrl) {
+      throw new Error('No image returned from OpenAI');
+    }
+
+    entry.status = 'done';
+    entry.imageUrl = imageUrl;
+    entry.updatedAt = Date.now();
+    entry.completedAt = Date.now();
   } catch (error) {
-    console.error('FULL ERROR:', error);
-
-    generation.status = 'error';
-    generation.error = {
-      message: error?.message || 'Unknown server error',
-      details: error?.response?.data || null,
-    };
-    generation.finishedAt = nowIso();
+    entry.status = 'error';
+    entry.error = error?.message || 'Unknown generation error';
+    entry.updatedAt = Date.now();
   }
-}
-
-function createGenerationRecord({
-  sessionId,
-  prompt,
-  imageBase64,
-  mimeType,
-  sourceGenerationId = null,
-  type = 'base',
-  variationIntent = 'base',
-}) {
-  const generation = {
-    id: createId('gen'),
-    sessionId,
-    sourceGenerationId,
-    type,
-    status: 'queued',
-    prompt: clampString(normalizeText(prompt), 4000),
-    mimeType: normalizeText(mimeType) || 'image/jpeg',
-    hasSketch: Boolean(imageBase64),
-    inputImageBase64: imageBase64 || null,
-    imageBase64: null,
-    error: null,
-    variationSeed: randomSeed(),
-    variationIntent,
-    meta: {},
-    createdAt: nowIso(),
-    startedAt: null,
-    finishedAt: null,
-  };
-
-  generationStore.set(generation.id, generation);
-  pushGenerationToSession(sessionId, generation.id);
-  trimGlobalMemory();
-
-  return generation;
 }
 
 app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    message: 'SketchIT backend is running',
-    model: MODEL_NAME,
-    imageSize: IMAGE_SIZE,
-    endpoints: [
-      'POST /generation/start',
-      'GET /generation/:id',
-      'POST /generation/:id/variation',
-      'GET /session/:sessionId',
-    ],
+  res.json({ ok: true, message: 'SketchIT backend is running' });
+});
+
+app.get('/session/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found.' });
+  }
+
+  const items = session.generationIds
+    .map((id) => generations.get(id))
+    .filter(Boolean);
+
+  return res.json({
+    sessionId,
+    items,
   });
+});
+
+app.get('/generation/:id', (req, res) => {
+  const entry = generations.get(req.params.id);
+
+  if (!entry) {
+    return res.status(404).json({ error: 'Generation not found.' });
+  }
+
+  return res.json(entry);
 });
 
 app.post('/generation/start', async (req, res) => {
@@ -667,191 +513,173 @@ app.post('/generation/start', async (req, res) => {
       imageBase64,
       mimeType = 'image/jpeg',
       sessionId,
+      generationMode = 'balanced',
     } = req.body ?? {};
 
     const safePrompt = normalizeText(prompt);
 
     if (!safePrompt && !imageBase64) {
-      return res.status(400).json({
-        error: 'Either prompt or imageBase64 is required.',
-      });
+      return res.status(400).json({ error: 'Either prompt or imageBase64 is required.' });
     }
 
-    const session = ensureSession(sessionId);
+    const generationId = createId('gen');
+    const session = getOrCreateSession(sessionId);
 
-    const generation = createGenerationRecord({
+    const entry = {
+      id: generationId,
       sessionId: session.id,
+      prompt: safePrompt,
+      type: imageBase64 ? 'sketch' : 'text',
+      generationMode,
+      imageUrl: null,
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      completedAt: null,
+      error: null,
+      variationOf: null,
+      variationIndex: 0,
+    };
+
+    generations.set(generationId, entry);
+    session.generationIds.push(generationId);
+    session.updatedAt = Date.now();
+
+    runGeneration({
+      generationId,
       prompt: safePrompt,
       imageBase64,
       mimeType,
-      type: 'base',
-      variationIntent: 'base',
+      generationMode,
+      variationIndex: 0,
     });
 
-    processGeneration(generation.id).catch((error) => {
-      console.error('Background generation crash:', error);
-    });
-
-    return res.status(202).json({
-      ok: true,
-      generation: sanitizeGenerationForClient(generation),
+    return res.json({
+      generationId,
+      sessionId: session.id,
+      status: 'pending',
+      generationMode,
     });
   } catch (error) {
-    console.error('START GENERATION ERROR:', error);
-
-    return res.status(500).json({
-      error: error?.message || 'Unknown server error',
-      details: error?.response?.data || null,
-    });
+    return res.status(500).json({ error: error?.message || 'Failed to start generation.' });
   }
-});
-
-app.get('/generation/:id', async (req, res) => {
-  const generation = generationStore.get(req.params.id);
-
-  if (!generation) {
-    return res.status(404).json({
-      error: 'Generation not found.',
-    });
-  }
-
-  return res.json({
-    ok: true,
-    generation: sanitizeGenerationForClient(generation),
-  });
 });
 
 app.post('/generation/:id/variation', async (req, res) => {
   try {
-    const sourceGeneration = generationStore.get(req.params.id);
+    const base = generations.get(req.params.id);
 
-    if (!sourceGeneration) {
-      return res.status(404).json({
-        error: 'Source generation not found.',
-      });
+    if (!base) {
+      return res.status(404).json({ error: 'Base generation not found.' });
     }
 
     const {
-      prompt,
-      variationIntent = 'alternate',
+      prompt = base.prompt,
+      imageBase64,
+      mimeType = 'image/jpeg',
+      generationMode = base.generationMode || 'balanced',
     } = req.body ?? {};
 
-    const variationPrompt = normalizeText(prompt) || sourceGeneration.prompt;
+    const variationId = createId('gen');
+    const session = getOrCreateSession(base.sessionId);
+    const siblingCount = session.generationIds
+      .map((id) => generations.get(id))
+      .filter((item) => item?.variationOf === base.id).length;
 
-    const variation = createGenerationRecord({
-      sessionId: sourceGeneration.sessionId,
-      prompt: variationPrompt,
-      imageBase64: sourceGeneration.inputImageBase64,
-      mimeType: sourceGeneration.mimeType,
-      sourceGenerationId: sourceGeneration.id,
-      type: 'variation',
-      variationIntent,
+    const entry = {
+      id: variationId,
+      sessionId: session.id,
+      prompt: normalizeText(prompt),
+      type: imageBase64 || base.type === 'sketch' ? 'sketch' : 'text',
+      generationMode,
+      imageUrl: null,
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      completedAt: null,
+      error: null,
+      variationOf: base.id,
+      variationIndex: siblingCount + 1,
+    };
+
+    generations.set(variationId, entry);
+    session.generationIds.push(variationId);
+    session.updatedAt = Date.now();
+
+    runGeneration({
+      generationId: variationId,
+      prompt: entry.prompt,
+      imageBase64,
+      mimeType,
+      generationMode,
+      variationIndex: entry.variationIndex,
     });
 
-    processGeneration(variation.id).catch((error) => {
-      console.error('Background variation crash:', error);
-    });
-
-    return res.status(202).json({
-      ok: true,
-      generation: sanitizeGenerationForClient(variation),
+    return res.json({
+      generationId: variationId,
+      sessionId: session.id,
+      status: 'pending',
+      generationMode,
+      variationOf: base.id,
     });
   } catch (error) {
-    console.error('VARIATION ERROR:', error);
-
-    return res.status(500).json({
-      error: error?.message || 'Unknown server error',
-      details: error?.response?.data || null,
-    });
+    return res.status(500).json({ error: error?.message || 'Failed to create variation.' });
   }
 });
 
-app.get('/session/:sessionId', (req, res) => {
-  const session = sessionStore.get(req.params.sessionId);
-
-  if (!session) {
-    return res.status(404).json({
-      error: 'Session not found.',
-    });
-  }
-
-  const generations = session.generationIds
-    .map((id) => generationStore.get(id))
-    .filter(Boolean)
-    .map((item) => sanitizeGenerationForClient(item));
-
-  return res.json({
-    ok: true,
-    session: {
-      id: session.id,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-      generations,
-    },
-  });
-});
-
-/**
- * Temporary compatibility route so your current frontend does not break instantly.
- *
- * Later we remove this once the app switches to:
- * - POST /generation/start
- * - GET /generation/:id
- */
 app.post('/generate', async (req, res) => {
   try {
-    const { prompt, imageBase64, mimeType = 'image/jpeg', sessionId } = req.body ?? {};
+    const {
+      prompt,
+      imageBase64,
+      mimeType = 'image/jpeg',
+      generationMode = 'balanced',
+    } = req.body ?? {};
+
     const safePrompt = normalizeText(prompt);
 
     if (!safePrompt && !imageBase64) {
-      return res.status(400).json({
-        error: 'Either prompt or imageBase64 is required.',
-      });
+      return res.status(400).json({ error: 'Either prompt or imageBase64 is required.' });
     }
 
-    const session = ensureSession(sessionId);
+    const generationId = createId('legacy');
+    generations.set(generationId, {
+      id: generationId,
+      sessionId: null,
+      prompt: safePrompt,
+      type: imageBase64 ? 'sketch' : 'text',
+      generationMode,
+      imageUrl: null,
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      completedAt: null,
+      error: null,
+      variationOf: null,
+      variationIndex: 0,
+    });
 
-    const generation = createGenerationRecord({
-      sessionId: session.id,
+    await runGeneration({
+      generationId,
       prompt: safePrompt,
       imageBase64,
       mimeType,
-      type: 'base',
-      variationIntent: 'base',
+      generationMode,
+      variationIndex: 0,
     });
 
-    await processGeneration(generation.id);
+    const entry = generations.get(generationId);
 
-    const finished = generationStore.get(generation.id);
-
-    if (!finished) {
-      return res.status(500).json({
-        error: 'Generation disappeared unexpectedly.',
-      });
+    if (entry?.status !== 'done') {
+      return res.status(500).json({ error: entry?.error || 'Generation failed.' });
     }
 
-    if (finished.status === 'error') {
-      return res.status(500).json({
-        error: finished.error?.message || 'Unknown server error',
-        details: finished.error?.details || null,
-      });
-    }
-
-    return res.json({
-      imageBase64: finished.imageBase64,
-      generationId: finished.id,
-      sessionId: finished.sessionId,
-    });
+    return res.json({ imageUrl: entry.imageUrl, generationId, generationMode });
   } catch (error) {
-    console.error('LEGACY GENERATE ERROR:', error);
-
-    return res.status(500).json({
-      error: error?.message || 'Unknown server error',
-      details: error?.response?.data || null,
-    });
+    return res.status(500).json({ error: error?.message || 'Failed to generate image.' });
   }
 });
 
 app.listen(port, () => {
-  console.log(`SketchIT backend running on http://localhost:${port}`);
+  console.log(`Server running on port ${port}`);
 });
