@@ -19,8 +19,27 @@ const openai = new OpenAI({
 const generations = new Map();
 const sessions = new Map();
 
-const FREE_DAILY_LIMIT = 2;
-const PREMIUM_DAILY_LIMIT = 50;
+const PLAN_CONFIG = {
+  free: {
+    key: 'free',
+    title: 'Free',
+    dailyLimit: 2,
+    modes: ['balanced'],
+    variations: false,
+    notes: ['2 Medium images per day keeps the free plan useful without making costs explode.'],
+  },
+  premium: {
+    key: 'premium',
+    title: 'Premium',
+    dailyLimit: 50,
+    modes: ['fast', 'balanced', 'premium'],
+    variations: true,
+    notes: ['A capped premium subscription is much safer than unlimited AI generations.'],
+  },
+};
+
+const FREE_DAILY_LIMIT = PLAN_CONFIG.free.dailyLimit;
+const PREMIUM_DAILY_LIMIT = PLAN_CONFIG.premium.dailyLimit;
 
 function normalizeText(value = '') {
   return String(value).trim();
@@ -591,6 +610,13 @@ async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'im
 
 app.get('/', (_req, res) => {
   res.json({ ok: true, message: 'SketchIT backend is running' });
+});
+
+app.get('/plans', (_req, res) => {
+  return res.json({
+    ok: true,
+    plans: PLAN_CONFIG,
+  });
 });
 
 app.get('/usage/:sessionId', (req, res) => {
