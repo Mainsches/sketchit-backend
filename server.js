@@ -101,11 +101,25 @@ function detectShelfCount(prompt = '') {
 function detectMaterial(prompt = '') {
   const text = prompt.toLowerCase();
 
-  if (text.includes('oak') || text.includes('wood') || text.includes('wooden') || text.includes('walnut') || text.includes('ash wood') || text.includes('grey wood') || text.includes('gray wood')) {
+  if (
+    text.includes('oak') ||
+    text.includes('wood') ||
+    text.includes('wooden') ||
+    text.includes('walnut') ||
+    text.includes('ash wood') ||
+    text.includes('grey wood') ||
+    text.includes('gray wood')
+  ) {
     return 'wood';
   }
 
-  if (text.includes('metal') || text.includes('steel') || text.includes('aluminium') || text.includes('aluminum') || text.includes('iron')) {
+  if (
+    text.includes('metal') ||
+    text.includes('steel') ||
+    text.includes('aluminium') ||
+    text.includes('aluminum') ||
+    text.includes('iron')
+  ) {
     return 'metal';
   }
 
@@ -113,7 +127,12 @@ function detectMaterial(prompt = '') {
     return 'glass';
   }
 
-  if (text.includes('fabric') || text.includes('textile') || text.includes('upholstered') || text.includes('cushion')) {
+  if (
+    text.includes('fabric') ||
+    text.includes('textile') ||
+    text.includes('upholstered') ||
+    text.includes('cushion')
+  ) {
     return 'fabric';
   }
 
@@ -444,6 +463,7 @@ function ensureSessionUsage(session) {
     session.usage = {
       dayKey: todayKey,
       dailyCount: 0,
+      pendingCount: 0,
       totalCount: 0,
     };
   }
@@ -451,6 +471,7 @@ function ensureSessionUsage(session) {
   if (session.usage.dayKey !== todayKey) {
     session.usage.dayKey = todayKey;
     session.usage.dailyCount = 0;
+    session.usage.pendingCount = 0;
   }
 
   return session.usage;
@@ -469,6 +490,7 @@ function getOrCreateSession(sessionId) {
       usage: {
         dayKey: getUtcDayKey(),
         dailyCount: 0,
+        pendingCount: 0,
         totalCount: 0,
       },
     });
@@ -483,15 +505,19 @@ function getUsagePayload(session) {
   const usage = ensureSessionUsage(session);
   const dailyLimit = session.isPremium ? PREMIUM_DAILY_LIMIT : FREE_DAILY_LIMIT;
   const remainingToday = Math.max(0, dailyLimit - usage.dailyCount);
+  const remainingToStart = Math.max(0, dailyLimit - usage.dailyCount - usage.pendingCount);
 
   return {
     sessionId: session.id,
     isPremium: Boolean(session.isPremium),
     dailyCount: usage.dailyCount,
+    pendingCount: usage.pendingCount,
     dailyLimit,
     remainingToday,
+    remainingToStart,
     totalCount: usage.totalCount,
     resetDayKey: usage.dayKey,
+    canStartGeneration: remainingToStart > 0,
     canUsePremiumMode: Boolean(session.isPremium),
     canUseVariations: Boolean(session.isPremium),
   };
@@ -529,7 +555,7 @@ function validateUsageForGeneration(session, generationMode, isVariation = false
     };
   }
 
-  if (usage.remainingToday <= 0) {
+  if (usage.remainingToStart <= 0) {
     return {
       allowed: false,
       status: 429,
@@ -547,15 +573,38 @@ function validateUsageForGeneration(session, generationMode, isVariation = false
   };
 }
 
-function registerUsage(session) {
+function registerGenerationStart(session) {
   const usage = ensureSessionUsage(session);
-  usage.dailyCount += 1;
-  usage.totalCount += 1;
+  usage.pendingCount += 1;
   session.updatedAt = Date.now();
   return getUsagePayload(session);
 }
 
-async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'image/jpeg', generationMode = 'balanced', variationIndex = 0 }) {
+function finalizeGenerationUsage(sessionId, success) {
+  const session = sessions.get(sessionId);
+  if (!session) return null;
+
+  const usage = ensureSessionUsage(session);
+  usage.pendingCount = Math.max(0, usage.pendingCount - 1);
+
+  if (success) {
+    usage.dailyCount += 1;
+    usage.totalCount += 1;
+  }
+
+  session.updatedAt = Date.now();
+  return getUsagePayload(session);
+}
+
+async function runGeneration({
+  generationId,
+  sessionId,
+  prompt,
+  imageBase64,
+  mimeType = 'image/jpeg',
+  generationMode = 'balanced',
+  variationIndex = 0,
+}) {
   const entry = generations.get(generationId);
   if (!entry) return;
 
@@ -569,7 +618,11 @@ async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'im
     if (imageBase64) {
       const cleanBase64 = imageBase64.replace(/^data:image\/\w+;base64,/, '');
       const imageBuffer = Buffer.from(cleanBase64, 'base64');
-      const imageFile = await toFile(imageBuffer, mimeType === 'image/png' ? 'sketch.png' : 'sketch.jpg', { type: mimeType });
+      const imageFile = await toFile(
+        imageBuffer,
+        mimeType === 'image/png' ? 'sketch.png' : 'sketch.jpg',
+        { type: mimeType }
+      );
 
       result = await openai.images.edit({
         model: 'gpt-image-1',
@@ -598,6 +651,11 @@ async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'im
     entry.completedAt = Date.now();
     entry.finishedAt = new Date().toISOString();
     entry.error = null;
+
+    const usage = finalizeGenerationUsage(sessionId, true);
+    if (usage) {
+      entry.usageSnapshot = usage;
+    }
   } catch (error) {
     entry.status = 'error';
     entry.error = {
@@ -605,6 +663,11 @@ async function runGeneration({ generationId, prompt, imageBase64, mimeType = 'im
     };
     entry.updatedAt = Date.now();
     entry.finishedAt = new Date().toISOString();
+
+    const usage = finalizeGenerationUsage(sessionId, false);
+    if (usage) {
+      entry.usageSnapshot = usage;
+    }
   }
 }
 
@@ -694,7 +757,7 @@ app.post('/generation/start', async (req, res) => {
       return jsonError(res, access.status, access.code, access.message, { usage: access.usage });
     }
 
-    const usage = registerUsage(session);
+    const usage = registerGenerationStart(session);
     const generationId = createId('gen');
 
     const entry = {
@@ -720,6 +783,7 @@ app.post('/generation/start', async (req, res) => {
       finishedAt: null,
       updatedAt: Date.now(),
       variationIndex: 0,
+      usageSnapshot: usage,
     };
 
     generations.set(generationId, entry);
@@ -728,6 +792,7 @@ app.post('/generation/start', async (req, res) => {
 
     runGeneration({
       generationId,
+      sessionId: session.id,
       prompt: safePrompt,
       imageBase64,
       mimeType,
@@ -766,7 +831,7 @@ app.post('/generation/:id/variation', async (req, res) => {
       return jsonError(res, access.status, access.code, access.message, { usage: access.usage });
     }
 
-    const usage = registerUsage(session);
+    const usage = registerGenerationStart(session);
     const variationId = createId('gen');
     const siblingCount = session.generationIds
       .map((id) => generations.get(id))
@@ -795,6 +860,7 @@ app.post('/generation/:id/variation', async (req, res) => {
       finishedAt: null,
       updatedAt: Date.now(),
       variationIndex: siblingCount + 1,
+      usageSnapshot: usage,
     };
 
     generations.set(variationId, entry);
@@ -803,6 +869,7 @@ app.post('/generation/:id/variation', async (req, res) => {
 
     runGeneration({
       generationId: variationId,
+      sessionId: session.id,
       prompt: entry.prompt,
       imageBase64: null,
       mimeType: entry.mimeType,
@@ -861,6 +928,7 @@ app.post('/generate', async (req, res) => {
 
     await runGeneration({
       generationId,
+      sessionId: null,
       prompt: safePrompt,
       imageBase64,
       mimeType,
