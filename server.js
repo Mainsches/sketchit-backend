@@ -17,7 +17,8 @@ const openai = new OpenAI({
 });
 
 const generations = new Map();
-const sessions = new Map();
+const userSessions = new Map();
+const sessionToUserKey = new Map();
 
 const PLAN_CONFIG = {
   free: {
@@ -26,7 +27,6 @@ const PLAN_CONFIG = {
     dailyLimit: 2,
     modes: ['balanced'],
     variations: false,
-    notes: ['2 Medium images per day keeps the free plan useful without making costs explode.'],
   },
   premium: {
     key: 'premium',
@@ -34,7 +34,6 @@ const PLAN_CONFIG = {
     dailyLimit: 50,
     modes: ['fast', 'balanced', 'premium'],
     variations: true,
-    notes: ['A capped premium subscription is much safer than unlimited AI generations.'],
   },
 };
 
@@ -51,6 +50,21 @@ function createId(prefix = 'gen') {
 
 function getUtcDayKey(timestamp = Date.now()) {
   return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+function resolveUserKey(sessionId, deviceId) {
+  const safeDeviceId = normalizeText(deviceId);
+  const safeSessionId = normalizeText(sessionId);
+
+  if (safeDeviceId) {
+    return `device:${safeDeviceId}`;
+  }
+
+  if (safeSessionId) {
+    return `session:${safeSessionId}`;
+  }
+
+  return `session:${createId('anon')}`;
 }
 
 function textToNumber(value = '') {
@@ -456,7 +470,7 @@ function getImageUrlFromResult(result) {
   return null;
 }
 
-function ensureSessionUsage(session) {
+function ensureUserUsage(session) {
   const todayKey = getUtcDayKey();
 
   if (!session.usage) {
@@ -477,12 +491,16 @@ function ensureSessionUsage(session) {
   return session.usage;
 }
 
-function getOrCreateSession(sessionId) {
-  const safeSessionId = sessionId || createId('session');
+function getOrCreateUserSession({ sessionId, deviceId }) {
+  const userKey = resolveUserKey(sessionId, deviceId);
+  const safeSessionId = normalizeText(sessionId) || createId('session');
+  const safeDeviceId = normalizeText(deviceId) || null;
 
-  if (!sessions.has(safeSessionId)) {
-    sessions.set(safeSessionId, {
-      id: safeSessionId,
+  if (!userSessions.has(userKey)) {
+    userSessions.set(userKey, {
+      userKey,
+      sessionId: safeSessionId,
+      deviceId: safeDeviceId,
       generationIds: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -496,19 +514,48 @@ function getOrCreateSession(sessionId) {
     });
   }
 
-  const session = sessions.get(safeSessionId);
-  ensureSessionUsage(session);
+  const session = userSessions.get(userKey);
+  ensureUserUsage(session);
+
+  if (safeSessionId) {
+    session.sessionId = safeSessionId;
+    sessionToUserKey.set(safeSessionId, userKey);
+  }
+
+  if (safeDeviceId) {
+    session.deviceId = safeDeviceId;
+  }
+
   return session;
 }
 
+function findExistingUserSession({ sessionId, deviceId }) {
+  const safeDeviceId = normalizeText(deviceId);
+  const safeSessionId = normalizeText(sessionId);
+
+  if (safeDeviceId) {
+    const userKey = resolveUserKey(safeSessionId, safeDeviceId);
+    return userSessions.get(userKey) || null;
+  }
+
+  if (safeSessionId && sessionToUserKey.has(safeSessionId)) {
+    const userKey = sessionToUserKey.get(safeSessionId);
+    return userSessions.get(userKey) || null;
+  }
+
+  return null;
+}
+
 function getUsagePayload(session) {
-  const usage = ensureSessionUsage(session);
+  const usage = ensureUserUsage(session);
   const dailyLimit = session.isPremium ? PREMIUM_DAILY_LIMIT : FREE_DAILY_LIMIT;
   const remainingToday = Math.max(0, dailyLimit - usage.dailyCount);
   const remainingToStart = Math.max(0, dailyLimit - usage.dailyCount - usage.pendingCount);
 
   return {
-    sessionId: session.id,
+    sessionId: session.sessionId,
+    userKey: session.userKey,
+    deviceId: session.deviceId || null,
     isPremium: Boolean(session.isPremium),
     dailyCount: usage.dailyCount,
     pendingCount: usage.pendingCount,
@@ -574,17 +621,17 @@ function validateUsageForGeneration(session, generationMode, isVariation = false
 }
 
 function registerGenerationStart(session) {
-  const usage = ensureSessionUsage(session);
+  const usage = ensureUserUsage(session);
   usage.pendingCount += 1;
   session.updatedAt = Date.now();
   return getUsagePayload(session);
 }
 
-function finalizeGenerationUsage(sessionId, success) {
-  const session = sessions.get(sessionId);
+function finalizeGenerationUsage(userKey, success) {
+  const session = userSessions.get(userKey);
   if (!session) return null;
 
-  const usage = ensureSessionUsage(session);
+  const usage = ensureUserUsage(session);
   usage.pendingCount = Math.max(0, usage.pendingCount - 1);
 
   if (success) {
@@ -598,7 +645,7 @@ function finalizeGenerationUsage(sessionId, success) {
 
 async function runGeneration({
   generationId,
-  sessionId,
+  userKey,
   prompt,
   imageBase64,
   mimeType = 'image/jpeg',
@@ -652,7 +699,7 @@ async function runGeneration({
     entry.finishedAt = new Date().toISOString();
     entry.error = null;
 
-    const usage = finalizeGenerationUsage(sessionId, true);
+    const usage = finalizeGenerationUsage(userKey, true);
     if (usage) {
       entry.usageSnapshot = usage;
     }
@@ -664,7 +711,7 @@ async function runGeneration({
     entry.updatedAt = Date.now();
     entry.finishedAt = new Date().toISOString();
 
-    const usage = finalizeGenerationUsage(sessionId, false);
+    const usage = finalizeGenerationUsage(userKey, false);
     if (usage) {
       entry.usageSnapshot = usage;
     }
@@ -683,7 +730,18 @@ app.get('/plans', (_req, res) => {
 });
 
 app.get('/usage/:sessionId', (req, res) => {
-  const session = getOrCreateSession(req.params.sessionId);
+  const sessionId = req.params.sessionId;
+  const deviceId = req.query.deviceId;
+
+  const existing = findExistingUserSession({ sessionId, deviceId });
+
+  const session =
+    existing ||
+    getOrCreateUserSession({
+      sessionId,
+      deviceId,
+    });
+
   return res.json({
     ok: true,
     usage: getUsagePayload(session),
@@ -691,7 +749,11 @@ app.get('/usage/:sessionId', (req, res) => {
 });
 
 app.post('/session/:sessionId/premium', (req, res) => {
-  const session = getOrCreateSession(req.params.sessionId);
+  const session = getOrCreateUserSession({
+    sessionId: req.params.sessionId,
+    deviceId: req.body?.deviceId,
+  });
+
   const isPremium = Boolean(req.body?.isPremium);
   session.isPremium = isPremium;
   session.updatedAt = Date.now();
@@ -703,7 +765,10 @@ app.post('/session/:sessionId/premium', (req, res) => {
 });
 
 app.get('/session/:sessionId', (req, res) => {
-  const session = sessions.get(req.params.sessionId);
+  const session = findExistingUserSession({
+    sessionId: req.params.sessionId,
+    deviceId: req.query.deviceId,
+  });
 
   if (!session) {
     return jsonError(res, 404, 'SESSION_NOT_FOUND', 'Session not found.');
@@ -715,7 +780,8 @@ app.get('/session/:sessionId', (req, res) => {
 
   return res.json({
     ok: true,
-    sessionId: session.id,
+    sessionId: session.sessionId,
+    userKey: session.userKey,
     usage: getUsagePayload(session),
     items,
   });
@@ -741,6 +807,7 @@ app.post('/generation/start', async (req, res) => {
       imageBase64,
       mimeType = 'image/jpeg',
       sessionId,
+      deviceId,
       generationMode = 'balanced',
     } = req.body ?? {};
 
@@ -750,7 +817,7 @@ app.post('/generation/start', async (req, res) => {
       return jsonError(res, 400, 'INVALID_INPUT', 'Either prompt or imageBase64 is required.');
     }
 
-    const session = getOrCreateSession(sessionId);
+    const session = getOrCreateUserSession({ sessionId, deviceId });
     const access = validateUsageForGeneration(session, generationMode, false);
 
     if (!access.allowed) {
@@ -762,7 +829,9 @@ app.post('/generation/start', async (req, res) => {
 
     const entry = {
       id: generationId,
-      sessionId: session.id,
+      sessionId: session.sessionId,
+      userKey: session.userKey,
+      deviceId: session.deviceId || null,
       sourceGenerationId: null,
       prompt: safePrompt,
       type: 'base',
@@ -792,7 +861,7 @@ app.post('/generation/start', async (req, res) => {
 
     runGeneration({
       generationId,
-      sessionId: session.id,
+      userKey: session.userKey,
       prompt: safePrompt,
       imageBase64,
       mimeType,
@@ -818,7 +887,15 @@ app.post('/generation/:id/variation', async (req, res) => {
       return jsonError(res, 404, 'BASE_NOT_FOUND', 'Base generation not found.');
     }
 
-    const session = getOrCreateSession(base.sessionId);
+    const session = findExistingUserSession({
+      sessionId: base.sessionId,
+      deviceId: req.body?.deviceId || base.deviceId,
+    });
+
+    if (!session) {
+      return jsonError(res, 404, 'SESSION_NOT_FOUND', 'Session not found.');
+    }
+
     const {
       prompt = base.prompt,
       generationMode = base.generationMode || 'balanced',
@@ -839,7 +916,9 @@ app.post('/generation/:id/variation', async (req, res) => {
 
     const entry = {
       id: variationId,
-      sessionId: session.id,
+      sessionId: session.sessionId,
+      userKey: session.userKey,
+      deviceId: session.deviceId || null,
       sourceGenerationId: base.id,
       prompt: normalizeText(prompt),
       type: 'variation',
@@ -869,7 +948,7 @@ app.post('/generation/:id/variation', async (req, res) => {
 
     runGeneration({
       generationId: variationId,
-      sessionId: session.id,
+      userKey: session.userKey,
       prompt: entry.prompt,
       imageBase64: null,
       mimeType: entry.mimeType,
@@ -906,6 +985,8 @@ app.post('/generate', async (req, res) => {
     generations.set(generationId, {
       id: generationId,
       sessionId: null,
+      userKey: null,
+      deviceId: null,
       sourceGenerationId: null,
       prompt: safePrompt,
       type: 'base',
@@ -928,7 +1009,7 @@ app.post('/generate', async (req, res) => {
 
     await runGeneration({
       generationId,
-      sessionId: null,
+      userKey: null,
       prompt: safePrompt,
       imageBase64,
       mimeType,
