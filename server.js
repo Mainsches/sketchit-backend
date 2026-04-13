@@ -30,7 +30,7 @@ const PLAN_CONFIG = {
   free: {
     key: 'free',
     title: 'Free',
-    dailyLimit: 2,
+    dailyLimit: 3,
     modes: ['balanced'],
     variations: false,
   },
