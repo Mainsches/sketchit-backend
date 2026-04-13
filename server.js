@@ -190,8 +190,13 @@ function jsonError(res, status, code, message, extra = {}) {
   });
 }
 
-function validateUsageForGeneration(session, generationMode, isVariation = false) {
+function isCoinConsumptionSource(value) {
+  return String(value ?? '').toLowerCase() === 'coin';
+}
+
+function validateUsageForGeneration(session, generationMode, isVariation = false, options = {}) {
   const usage = getUsagePayload(session);
+  const billedWithCoin = Boolean(options?.billedWithCoin);
 
   if (!usage.isPremium && generationMode === 'premium') {
     return {
@@ -213,7 +218,7 @@ function validateUsageForGeneration(session, generationMode, isVariation = false
     };
   }
 
-  if (usage.remainingToStart <= 0) {
+  if (!billedWithCoin && usage.remainingToStart <= 0) {
     return {
       allowed: false,
       status: 429,
@@ -231,22 +236,30 @@ function validateUsageForGeneration(session, generationMode, isVariation = false
   };
 }
 
-function registerGenerationStart(session) {
+function registerGenerationStart(session, reserveFreeDailySlot = true) {
   const usage = ensureUserUsage(session);
-  usage.pendingCount += 1;
+  if (reserveFreeDailySlot) {
+    usage.pendingCount += 1;
+  }
   session.updatedAt = Date.now();
   return getUsagePayload(session);
 }
 
-function finalizeGenerationUsage(userKey, success) {
+function finalizeGenerationUsage(userKey, success, options = {}) {
   const session = userSessions.get(userKey);
   if (!session) return null;
 
+  const { consumeFreeDaily = true, hadReservedFreeSlot = true } = options;
+
   const usage = ensureUserUsage(session);
-  usage.pendingCount = Math.max(0, usage.pendingCount - 1);
+  if (hadReservedFreeSlot) {
+    usage.pendingCount = Math.max(0, usage.pendingCount - 1);
+  }
 
   if (success) {
-    usage.dailyCount += 1;
+    if (consumeFreeDaily) {
+      usage.dailyCount += 1;
+    }
     usage.totalCount += 1;
   }
 
@@ -266,6 +279,10 @@ async function runGeneration({
 }) {
   const entry = generations.get(generationId);
   if (!entry) return;
+
+  const billedWithCoin = isCoinConsumptionSource(entry.consumptionSource);
+  const consumeFreeDaily = !billedWithCoin;
+  const hadReservedFreeSlot = !billedWithCoin;
 
   try {
     entry.status = 'processing';
@@ -318,7 +335,7 @@ async function runGeneration({
     entry.finishedAt = new Date().toISOString();
     entry.error = null;
 
-    const usage = finalizeGenerationUsage(userKey, true);
+    const usage = finalizeGenerationUsage(userKey, true, { consumeFreeDaily, hadReservedFreeSlot });
     if (usage) {
       entry.usageSnapshot = usage;
     }
@@ -330,7 +347,7 @@ async function runGeneration({
     entry.updatedAt = Date.now();
     entry.finishedAt = new Date().toISOString();
 
-    const usage = finalizeGenerationUsage(userKey, false);
+    const usage = finalizeGenerationUsage(userKey, false, { consumeFreeDaily, hadReservedFreeSlot });
     if (usage) {
       entry.usageSnapshot = usage;
     }
@@ -429,23 +446,25 @@ app.post('/generation/start', async (req, res) => {
       deviceId,
       generationMode = 'balanced',
       mode: aiMode,
+      consumptionSource,
     } = req.body ?? {};
 
     const safePrompt = normalizeText(prompt);
     const mode = normalizeMode(aiMode);
+    const billedWithCoin = isCoinConsumptionSource(consumptionSource);
 
     if (!safePrompt && !imageBase64) {
       return jsonError(res, 400, 'INVALID_INPUT', 'Either prompt or imageBase64 is required.');
     }
 
     const session = getOrCreateUserSession({ sessionId, deviceId });
-    const access = validateUsageForGeneration(session, generationMode, false);
+    const access = validateUsageForGeneration(session, generationMode, false, { billedWithCoin });
 
     if (!access.allowed) {
       return jsonError(res, access.status, access.code, access.message, { usage: access.usage });
     }
 
-    const usage = registerGenerationStart(session);
+    const usage = registerGenerationStart(session, !billedWithCoin);
     const generationId = createId('gen');
 
     const entry = {
@@ -462,6 +481,7 @@ app.post('/generation/start', async (req, res) => {
       imageDataUrl: null,
       generationMode,
       mode,
+      consumptionSource: billedWithCoin ? 'coin' : null,
       status: 'pending',
       error: null,
       variationSeed: null,
@@ -469,6 +489,7 @@ app.post('/generation/start', async (req, res) => {
       meta: {
         promptUsed: safePrompt,
         mode,
+        ...(billedWithCoin ? { consumptionSource: 'coin' } : {}),
       },
       createdAt: new Date().toISOString(),
       startedAt: new Date().toISOString(),
@@ -525,17 +546,19 @@ app.post('/generation/:id/variation', async (req, res) => {
       generationMode = base.generationMode || 'balanced',
       variationIntent = 'alternate',
       mode: aiMode,
+      consumptionSource,
     } = req.body ?? {};
 
     const mode = normalizeMode(aiMode ?? base.mode);
+    const billedWithCoin = isCoinConsumptionSource(consumptionSource);
 
-    const access = validateUsageForGeneration(session, generationMode, true);
+    const access = validateUsageForGeneration(session, generationMode, true, { billedWithCoin });
 
     if (!access.allowed) {
       return jsonError(res, access.status, access.code, access.message, { usage: access.usage });
     }
 
-    const usage = registerGenerationStart(session);
+    const usage = registerGenerationStart(session, !billedWithCoin);
     const variationId = createId('gen');
     const siblingCount = session.generationIds
       .map((id) => generations.get(id))
@@ -555,6 +578,7 @@ app.post('/generation/:id/variation', async (req, res) => {
       imageDataUrl: null,
       generationMode,
       mode,
+      consumptionSource: billedWithCoin ? 'coin' : null,
       status: 'pending',
       error: null,
       variationSeed: Math.floor(Math.random() * 1000000),
@@ -562,6 +586,7 @@ app.post('/generation/:id/variation', async (req, res) => {
       meta: {
         promptUsed: normalizeText(prompt),
         mode,
+        ...(billedWithCoin ? { consumptionSource: 'coin' } : {}),
       },
       createdAt: new Date().toISOString(),
       startedAt: new Date().toISOString(),
