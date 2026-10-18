@@ -1,2 +1,8 @@
 node_modules
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*service-account*.json
+.test-data

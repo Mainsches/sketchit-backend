@@ -1,17 +1,26 @@
 {
   "name": "sketchit-backend",
-  "version": "1.1.0",
-  "description": "SketchIT backend with daily limits and premium-ready usage tracking",
+  "version": "1.2.0",
+  "description": "SketchIT backend with authenticated, database-backed free daily limits",
   "main": "server.js",
   "type": "module",
+  "engines": {
+    "node": ">=20.6"
+  },
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "migrate": "node scripts/migrate.js",
+    "test": "node --test --test-concurrency=1 --test-timeout=60000 \"test/**/*.test.js\""
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
-    "openai": "^5.20.2"
+    "openai": "^5.20.2",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.10"
   }
 }
