@@ -181,6 +181,8 @@ Required environment variables:
 - `OPENAI_API_KEY`
 - `DATABASE_URL`: Render **Internal** Database URL for the same region.
   If the external URL is used instead, verify its TLS settings on staging first.
+  For Supabase (staging), use the session pooler with `sslmode=verify-full`,
+  `sslrootcert` and set `SUPABASE_PROJECT_REF`; see `docs/staging-readiness.md` §11.
 - `NODE_ENV=production`
 - `TRUST_PROXY`: hop count of the hosting proxy (start with `1` on Render and
   verify on staging). `true` is rejected because it allows IP spoofing.

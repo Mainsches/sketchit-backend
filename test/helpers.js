@@ -5,6 +5,7 @@ import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import { createApp } from '../lib/app.js';
 import { buildTestConfig } from '../lib/config.js';
+import { isLoopbackDatabaseUrl } from '../lib/databaseTarget.js';
 import { createPostgresDatabase } from '../lib/db.js';
 import { runMigrations } from '../lib/migrate.js';
 
@@ -14,6 +15,11 @@ export const FAKE_PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 
 export const usingRealPostgres = Boolean(process.env.TEST_DATABASE_URL);
+
+// Tests create and drop schemas, so they only run against a local throwaway server.
+if (usingRealPostgres && !isLoopbackDatabaseUrl(process.env.TEST_DATABASE_URL)) {
+  throw new Error('TEST_DATABASE_URL must point to a local throwaway database (localhost, 127.0.0.1 or ::1).');
+}
 
 function wrapPglite(pglite) {
   const wrap = (queryable) => ({

@@ -149,7 +149,7 @@ test('migrations are recorded, idempotent and tamper-evident', async (t) => {
 
   assert.deepEqual(await runMigrations(db, { logger: silentLogger }), []);
   const { rows } = await db.query('SELECT version FROM schema_migrations ORDER BY version');
-  assert.deepEqual(rows.map((row) => row.version), ['001_initial_schema']);
+  assert.deepEqual(rows.map((row) => row.version), ['001_initial_schema', '002_restrict_data_api_access']);
 
   await db.query(`UPDATE schema_migrations SET checksum = 'tampered' WHERE version = '001_initial_schema'`);
   await assert.rejects(runMigrations(db, { logger: silentLogger }), /was modified after it was applied/);

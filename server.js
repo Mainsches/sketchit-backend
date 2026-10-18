@@ -40,7 +40,11 @@ async function main() {
     throw error;
   }
 
-  const db = createPostgresDatabase({ connectionString: config.databaseUrl, max: config.databasePoolMax });
+  const db = createPostgresDatabase({
+    connectionString: config.databaseUrl,
+    max: config.databasePoolMax,
+    statementTimeoutMs: config.databaseStatementTimeoutMs,
+  });
 
   if (config.migrateOnStart) {
     await runMigrations(db);

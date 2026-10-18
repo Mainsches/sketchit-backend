@@ -1,9 +1,12 @@
 # Staging readiness: separate Render staging service
 
 Scope: backend commit `76347300d07e742ad50d1ea329bbb65cf551e427` (authenticated
-contract, see `docs/backend-auth-migration.md`). This runbook sets up a
-**separate** staging service. The existing production service
-(`sketchit-backend-plov`, old API contract) is not touched.
+contract, see `docs/backend-auth-migration.md`) plus the Supabase PostgreSQL 17
+compatibility change (migration `002_restrict_data_api_access`, §11). This
+runbook sets up a **separate** staging service backed by the dedicated Supabase
+project `mainsches-ai-staging`. The existing production service
+(`sketchit-backend-plov`, old API contract) is not touched. The Supabase
+database of Mainsches Hub belongs to another product and must never be used.
 
 No real credentials, tokens or private URLs belong in this file. Placeholders
 are written as `<...>`.
@@ -20,6 +23,9 @@ fake only accepted a dummy key. No real OpenAI call was made.
 | `npm test` with PGlite | 33/33 pass |
 | `npm test` with real PostgreSQL (`TEST_DATABASE_URL`, pool of 20 connections) | 33/33 pass |
 | Real `server.js` processes, `NODE_ENV=production`, `TRUST_PROXY=1`, `TZ=Pacific/Kiritimati` (UTC+14) | 75/77 checks pass; the two open points are listed in §10 |
+| After the Supabase change: `npm test` with PGlite | all pass except 2 skipped (need real PostgreSQL) |
+| After the Supabase change: `npm test` with PostgreSQL 17.11 (Docker, `127.0.0.1`) | all pass, none skipped |
+| `pg` 8.23.1 TLS against PostgreSQL 17.11 with a private test CA | see §11.3 |
 
 Covered by the process-level run: startup guards, concurrent first boot of two
 instances (migration applied once), repeated migrations, the HTTP contract in
@@ -39,15 +45,16 @@ docker run -d --name <container> -p 127.0.0.1:55432:5432 \
 TEST_DATABASE_URL=postgresql://<user>:<random>@127.0.0.1:55432/<db> npm test
 ```
 
-Each test creates and drops its own schema. Never point `TEST_DATABASE_URL` at
-a staging or production database.
+Each test creates and drops its own schema. The test helpers refuse any
+`TEST_DATABASE_URL` whose host is not `localhost`, `127.0.0.1` or `::1`, so a
+staging, Supabase or production database cannot be used by mistake.
 
 ## 2. Required infrastructure
 
 | Resource | Notes |
 |---|---|
-| Render PostgreSQL, new instance (`<name>-staging-db`) | Never reuse a production database. PostgreSQL 16 was tested. Choose the plan deliberately: the free plan expires after a limited period and is deleted. |
-| Render Web Service, new (`<name>-staging`), same region as the database | Separate service. Do not change the production service. |
+| Supabase project `mainsches-ai-staging` (ref `ggzftvpqeiwwjoohurcv`, `eu-west-1`, PostgreSQL 17.11) | Used only by this staging service. Connection through the session pooler (§11). Never the Mainsches Hub project. |
+| Render Web Service, new (`<name>-staging`), region Frankfurt (closest to `eu-west-1`) | Separate service. Do not change the production service. |
 | OpenAI: none in phase 1 | Phase 2 (paid) needs a dedicated OpenAI project and key with a budget limit. |
 | A staging Git ref | A `staging` branch at the approved commit, not `main` (see §3, step 0). |
 
@@ -56,25 +63,27 @@ Storage: finished images are stored as base64 in PostgreSQL for 24 h (about
 
 ## 3. Render setup (separate service)
 
-0. **Protect production before any push.** `7634730` currently exists only
-   locally (`main` is one commit ahead of `origin/main`). In the Render
-   dashboard, open the existing production service and record its
-   *Branch* and *Auto-Deploy* settings. If it auto-deploys from `main`, pushing
-   `main` replaces production with the new contract and breaks installed apps
-   (`401`). Push the commit to a separate branch instead:
-   `git push origin 7634730:refs/heads/staging`. Push to `main` only as part of
-   an approved production release.
-1. Create the PostgreSQL instance (same region as step 2). Copy its
-   **Internal Database URL**.
+0. **Protect production before any push.** `origin/staging` is at `bc20f5e`
+   (auth contract and this runbook); `origin/main` (`fc7a70c`) is production.
+   The local branch is named `main` but carries the staging commits, so a plain
+   `git push` would update production. In the Render dashboard, record the
+   production service's *Branch* and *Auto-Deploy* settings. Push staging work
+   only with an explicit refspec, after review:
+   `git push origin <reviewed-commit>:refs/heads/staging`. Push to `main` only as
+   part of an approved production release.
+1. Prepare the Supabase project as described in §11.6 (CA certificate, SSL
+   enforcement, Data API, read-only identity check). Build the session pooler
+   URL from §11.2.
 2. Create a new Web Service from the repository:
    - Branch: `staging`; Auto-Deploy: **Off** (deploy manually).
    - Runtime: Node. Build command: `npm ci --omit=dev`.
    - Start command: `node server.js` (run Node directly so it receives `SIGTERM`).
    - Health check path: `/health`.
    - Instances: 1.
-3. Set the environment variables (§4), marking secrets as secret.
-4. Deploy manually. Expect the log lines `[migrate] applied 001_initial_schema`
-   and `Server running on port <PORT>`.
+3. Set the environment variables (§4), marking secrets as secret, and add the
+   Supabase CA certificate as the secret file `supabase-ca.crt`.
+4. Deploy manually. Expect the log lines `[migrate] applied 001_initial_schema`,
+   `[migrate] applied 002_restrict_data_api_access` and `Server running on port <PORT>`.
 
 Start order is enforced by `server.js`: configuration is validated, then
 migrations run (under an advisory lock), then interrupted jobs are recovered,
@@ -93,7 +102,11 @@ Phase 1: no OpenAI traffic. This is the default for staging.
 |---|---|---|
 | `NODE_ENV` | `production` | Enforces the `TRUST_PROXY` requirement. |
 | `TRUST_PROXY` | `1` | Assumption; must be verified on Render (§5). `true` is rejected at start. |
-| `DATABASE_URL` | `<Internal Database URL of the staging DB>` | Secret. See TLS below. |
+| `DATABASE_URL` | `postgresql://postgres.ggzftvpqeiwwjoohurcv:<db-password>@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=verify-full&sslrootcert=/etc/secrets/supabase-ca.crt` | Secret. Session pooler only (§11.2). Percent-encode special characters in the password. |
+| `SUPABASE_PROJECT_REF` | `ggzftvpqeiwwjoohurcv` | Not secret. The server refuses to start if `DATABASE_URL` belongs to another project. |
+| `DATABASE_POOL_MAX` | `5` | Must be set explicitly: the code default is 10. Must stay below the Supabase session pool size (§11.5). |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `30000` | Default. Server-side `statement_timeout` per session. |
+| `HEALTH_CHECK_TIMEOUT_MS` | `5000` | Default. `/health` answers 503 after this time. |
 | `OPENAI_API_KEY` | `staging-openai-disabled` | Not a key. The variable must be non-empty. |
 | `OPENAI_BASE_URL` | `http://127.0.0.1:9/v1` | Kill switch: the SDK honours this variable and connects to a closed local port. |
 | `NODE_VERSION` | `24` | Matches the tested runtime. `engines` (`>=20.6`) alone floats. |
@@ -112,17 +125,11 @@ Phase 2: real OpenAI calls, only after the release gates in §8.
   budget limit. Never reuse the production key, and never put it in `EXPO_PUBLIC_*`
   variables, `eas.json`, the app repository or logs.
 
-**TLS for `DATABASE_URL`.** Use the Internal Database URL (private network,
-same region). Verified local driver behaviour (`pg` 8.23.1):
-
-| URL suffix | Result |
-|---|---|
-| none | Connects without TLS. Acceptable only on the internal network. |
-| `?sslmode=require` | Treated as `verify-full`. Fails on self-signed or private-CA certificates. |
-| `?sslmode=no-verify` or `?sslmode=require&uselibpqcompat=true` | Encrypted, certificate not verified. |
-
-Do not use the External Database URL for the service. If it is ever needed,
-test `sslmode=verify-full` against Render's certificate first.
+**TLS for `DATABASE_URL`.** The Supabase connection crosses the public
+internet, so the certificate must be verified: `sslmode=verify-full` plus the
+Supabase CA certificate through `sslrootcert` (both required). The server and
+`npm run migrate` reject any other Supabase URL; see §11.2 for the exact rules
+and §11.3 for the verified driver behaviour.
 
 ## 5. Smoke tests on staging (no cost in phase 1)
 
@@ -221,7 +228,9 @@ limited per IP by `AUTH_RATE_LIMIT_PER_HOUR`, so the budget limit is the real ca
    `OPENAI_BASE_URL=http://127.0.0.1:9/v1`), then revoke the staging OpenAI key
    in the OpenAI dashboard.
 2. Suspend the staging web service.
-3. Delete the staging database (all staging users and images are removed).
+3. Pause or delete the Supabase project `mainsches-ai-staging` (deleting removes
+   all staging users and images), or reset only the backend tables (§11.8).
+   Reset the database password if it was ever exposed.
 4. Delete the `staging` branch if it is no longer needed.
 5. Remove `.env.local` from frontend test machines and uninstall staging builds.
 
@@ -229,13 +238,14 @@ limited per IP by `AUTH_RATE_LIMIT_PER_HOUR`, so the budget limit is the real ca
 
 Findings from the local run:
 
-- **`/health` hangs on an unresponsive database.** With the DB container
-  paused, `/health` did not answer within 30 s instead of returning 503;
-  other DB routes behave the same. The pool has no query timeout or TCP
-  keepalive. A refused connection (DB restart) correctly gives 503 and the pool
-  reconnects; the server process survives. Render treats a health-check
-  timeout as a failure, so this does not block staging, but a pool-level query
-  timeout or keepalive should be designed and reviewed before production.
+- **Unresponsive database (partly mitigated).** With the DB container paused,
+  `/health` originally did not answer within 30 s. Now `/health` answers 503
+  after `HEALTH_CHECK_TIMEOUT_MS` (5 s), every session has a server-side
+  `statement_timeout` (30 s) and `idle_in_transaction_session_timeout` (60 s),
+  and sockets use TCP keepalive. Still open: other routes on a connection whose
+  network path is dead wait until the socket fails; how fast that happens
+  depends on the host's TCP keepalive settings. A refused connection (DB
+  restart) gives 503 and the pool reconnects; the server process survives.
 - **Provider error messages are logged verbatim**
   (`[generation] … failed: GENERATION_FAILED <status> <message>`). Clients never
   see them. OpenAI masks keys in its own messages; still, review the log content
@@ -257,7 +267,229 @@ Evidence only obtainable on Render:
 - The actual proxy hop count (`TRUST_PROXY`).
 - The `SIGTERM` timing on redeploy (graceful shutdown is covered by an
   in-process test; Windows cannot deliver `SIGTERM` to a local process).
-- The certificate and TLS behaviour of the Render database URL.
 - The health-check timeout and cold-start behaviour of the chosen plan.
-- Behaviour during Render database maintenance.
 - A real OpenAI generation (phase 2 only).
+
+Evidence only obtainable against the Supabase project (§11.7): the pooler
+certificate chain and host name, session timeouts through the pooler, the
+pool size limit, Data API denial, latency from Render Frankfurt, and
+behaviour during Supabase maintenance or a pooler restart.
+
+## 11. Supabase PostgreSQL 17 (session pooler)
+
+### 11.1 Decision: session pooler, port 5432
+
+| Connection | Use | Reason |
+|---|---|---|
+| Session pooler `aws-0-eu-west-1.pooler.supabase.com:5432` | **Yes** | IPv4 (Render has no outbound IPv6). One server connection per client connection for its whole lifetime, so session state behaves like a direct connection. |
+| Transaction pooler, port 6543 | No | Rejected at start. Session settings (timeouts) would not stay on the server connection. |
+| Direct `db.<ref>.supabase.co:5432` | No | IPv6 only unless the IPv4 add-on is bought. Rejected by the code. |
+
+SQL patterns actually used by the backend, checked against session mode:
+
+| Pattern | Where | Session pooler |
+|---|---|---|
+| `BEGIN` … `COMMIT`/`ROLLBACK` on one checked-out client | `lib/db.js` `transaction()` | Safe. |
+| `pg_advisory_xact_lock` (transaction-scoped) | `lib/migrate.js` | Safe; released on commit or rollback, also in transaction mode. No session-level `pg_advisory_lock` exists in the code. |
+| `SELECT … FOR NO KEY UPDATE` row locks | `lib/generationService.js` | Safe; transaction-scoped. |
+| `INSERT … ON CONFLICT`, partial indexes, `CHECK` with regex, DDL inside a transaction | migrations, services | Supported by PostgreSQL 17; tested on 17.11. |
+| Parameterised queries | everywhere | `pg` uses unnamed prepared statements; no named statements, cursors, `LISTEN`/`NOTIFY` or temporary tables. |
+| Session settings via `set_config` after connect | `lib/db.js` `onConnect` | Requires session mode; this is why port 6543 is rejected. |
+| `options=-c search_path=…` startup parameter | test helpers only | Never used against Supabase. |
+
+### 11.2 Connection URL and project binding
+
+```
+postgresql://postgres.ggzftvpqeiwwjoohurcv:<db-password>@aws-0-eu-west-1.pooler.supabase.com:5432/postgres?sslmode=verify-full&sslrootcert=/etc/secrets/supabase-ca.crt
+```
+
+`lib/databaseTarget.js` (used by `server.js` and `npm run migrate`) decides on
+the parameters the installed `pg` client actually derives from the URL: it
+constructs a `pg.Client` without connecting and inspects its connection
+parameters. For every URL it rejects:
+
+- any query parameter given more than once, compared after percent-decoding and
+  case-insensitively (`pg` keeps the last value, so
+  `sslmode=verify-full&sslmode=disable` or `…&ssl%6Dode=disable` would turn TLS
+  off);
+- `host`, `hostaddr`, `port`, `user`, `database`, `dbname` and `options` query
+  parameters, which `pg` uses to replace parts of the URL;
+- a URL whose effective host differs from the host it names.
+
+For a Supabase host it additionally requires:
+
+- `SUPABASE_PROJECT_REF` set;
+- the session pooler host (`aws-<n>-<region>.pooler.supabase.com`), port 5432;
+- user exactly `postgres.<SUPABASE_PROJECT_REF>` and database `postgres`;
+- only the query parameters `sslmode=verify-full` and `sslrootcert`;
+- an effective `ssl` configuration with a CA certificate loaded from
+  `sslrootcert`, certificate verification on and the default host name check
+  in place;
+- `NODE_TLS_REJECT_UNAUTHORIZED` not set to `0`.
+
+A Hub URL pasted by mistake therefore fails before any connection, because its
+user names a different project. Error messages never repeat the URL or the CA
+path. Setting `SUPABASE_PROJECT_REF` with a non-Supabase URL is also rejected.
+
+### 11.3 TLS
+
+Driver behaviour (`pg` 8.23.1), verified against PostgreSQL 17.11 with a
+private test CA and a server certificate for `localhost`:
+
+| URL | Result |
+|---|---|
+| `sslmode=verify-full&sslrootcert=<ca file>`, host in certificate | Connected, TLS 1.3 |
+| `sslmode=verify-full` without CA | Rejected (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) |
+| `sslmode=require` without CA | Rejected; `pg` 8 treats `require` as `verify-full` |
+| `sslmode=verify-full&sslrootcert=<ca file>`, host not in certificate | Rejected (`ERR_TLS_CERT_ALTNAME_INVALID`) |
+| no `sslmode` | Connected without TLS (local only; rejected for Supabase by the config check) |
+
+`sslmode` in the URL replaces any `ssl` object passed in code, so the URL is the
+single place where TLS is configured. `sslrootcert` is read from a file.
+
+Setup:
+
+1. Supabase dashboard → Project Settings → Database → SSL configuration:
+   download the CA certificate and turn on *Enforce SSL on incoming connections*.
+2. Render → staging service → Environment → Secret Files: add it as
+   `supabase-ca.crt` (available at `/etc/secrets/supabase-ca.crt`). The CA
+   certificate is public, but keep it next to the other connection settings.
+3. Never use `sslmode=no-verify`, `rejectUnauthorized: false` or
+   `uselibpqcompat=true` to get past a certificate error.
+
+Not yet verified: whether the pooler's certificate chains to the downloaded CA
+and lists `aws-0-eu-west-1.pooler.supabase.com`. If the first read-only check
+(§11.6) fails with a certificate error, stop and decide explicitly. Do not
+weaken verification.
+
+### 11.4 Secrets
+
+- `DATABASE_URL` contains the database password. Store it only as a Render
+  secret environment variable. Never commit it, put it in `.env.example`, paste
+  it into chats or tickets, or log it.
+- The backend logs only error codes and messages for database failures; the
+  configuration check never echoes the URL.
+- Local `.env` files are git-ignored. `server.js` and `npm run migrate` load
+  `.env` through `dotenv`. Any local run against the staging project must set
+  the phase 1 OpenAI kill switch (§4) and must not use a real key.
+- Rotate the password (Supabase → Database → Reset password, then update the
+  Render secret and redeploy) after the test phase or after any suspected
+  exposure.
+
+### 11.5 Pool size and timeouts
+
+- In session mode every pooled client holds one server connection. One
+  instance uses at most `DATABASE_POOL_MAX` connections, including startup
+  migrations (they use the same pool); `npm run migrate` uses one. Set
+  `DATABASE_POOL_MAX=5` explicitly (the code default is 10). During a redeploy
+  old and new instance briefly run together (up to 10), plus one for a
+  pre-deploy migration. Keep this below the pool size shown under Supabase →
+  Database → Connection pooling, with room for manual checks. If the limit is
+  exceeded, new connections fail and requests return 500 or `/health` 503.
+- Per session (`lib/db.js`): `statement_timeout` = `DATABASE_STATEMENT_TIMEOUT_MS`
+  (30 s), `idle_in_transaction_session_timeout` = 60 s. No transaction waits on
+  OpenAI, so neither limit affects generation. Lock waits count towards
+  `statement_timeout`: a second instance waiting on the migration lock gives up
+  after 30 s and exits; Render restarts it.
+- Client side: connect timeout 10 s, idle client timeout 30 s, TCP keepalive
+  after 10 s, `/health` timeout 5 s.
+
+### 11.6 Migration strategy
+
+Both migrations run in one transaction under `pg_advisory_xact_lock`; a failure
+rolls everything back and the server does not start. Applied migrations are
+checksummed.
+
+`002_restrict_data_api_access` exists because Supabase grants objects in
+`public` to its Data API roles (`anon`, `authenticated`, `service_role`),
+directly and through default privileges. Without it, anyone with the public
+anon key could read token hashes and images through the REST API. The
+migration, run as the role that owns the backend tables:
+
+- enables (not forces) row level security on all backend tables, with no
+  policies; the owner, which is the backend, keeps full access;
+- revokes all table privileges from `PUBLIC` and, where the roles exist, from
+  `anon`, `authenticated` and `service_role`. `service_role` has `BYPASSRLS`,
+  so for it only the revoke protects the tables;
+- revokes the default privileges on tables, sequences and functions from the
+  three roles, both schema-level (`IN SCHEMA` current schema) and global. Default
+  privileges without `FOR ROLE` only apply to objects created by the role that
+  runs the migration, and a schema-level revoke cannot remove a global entry,
+  hence both;
+- revokes the built-in global default `EXECUTE` on new functions from `PUBLIC`
+  for this role (all functions this role creates in the staging database).
+
+All statements are idempotent; the migration system records the migration and
+applies it once.
+
+Verified locally on PostgreSQL 17.11 with `anon`, `authenticated` and
+`service_role BYPASSRLS` and Supabase-like schema default privileges set before
+migrating: none of the roles holds a privilege on a backend table (each gets
+`permission denied`), a table, sequence and function created afterwards by the
+owner grants nothing to them or to `PUBLIC`, and a mistakenly restored grant
+shows `anon` zero rows (RLS) but `service_role` all rows, which is why its
+grants are revoked. With the earlier version of the migration, `service_role`
+kept access to `auth_tokens` and new tables were granted to `anon`.
+
+Not reproducible locally (open live checks, §11.7): Supabase's actual default
+privilege entries, especially entries `FOR ROLE supabase_admin` or other
+roles. They only affect objects those roles create; the migrating role cannot
+change them unless it is a member of that role.
+
+Before the first deploy (needs explicit approval for read access to the
+staging project):
+
+1. Read-only identity check, from a trusted machine, with the URL from §11.2:
+   `SELECT current_database(), current_user, version();`,
+   `SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid();`
+   (expect `true`, TLS 1.2+), and
+   `SELECT count(*) FROM pg_tables WHERE schemaname = 'public';` (expect `0`
+   for the new project; any existing table means stop, this may not be the
+   intended database).
+2. Supabase → Project Settings → Data API: turn the Data API off, or remove
+   `public` from the exposed schemas. Staging does not need it.
+3. Deploy with `MIGRATE_ON_START=true` (or run `npm run migrate` as the Render
+   pre-deploy command). Expect both `[migrate] applied …` lines.
+
+### 11.7 Open verification on Supabase (not yet executed)
+
+No connection to the Supabase project has been made. These checks are
+required and need explicit approval and the real credentials:
+
+1. TLS: connection with `sslmode=verify-full` and the Supabase CA succeeds
+   through the session pooler (§11.3).
+2. Identity and empty schema (§11.6, step 1).
+3. First deploy: both migrations applied once; a redeploy is a no-op.
+4. Session settings through the pooler: `current_setting('statement_timeout')`
+   returns `30s` on a backend connection (a one-off read-only query through
+   `createPostgresDatabase`).
+5. Data API: a REST request to `/rest/v1/users` with the anon key is refused.
+   Supabase Security Advisor shows no "RLS disabled" findings.
+6. Grants after migrating (read-only): for `anon`, `authenticated` and
+   `service_role`, `has_table_privilege` is false on all five backend tables;
+   `SELECT defaclrole::regrole, defaclnamespace::regnamespace, defaclobjtype, defaclacl FROM pg_default_acl;`
+   shows no remaining grants to these roles for the migrating role (`postgres`),
+   and the owner of the backend tables is that role
+   (`SELECT tablename, tableowner FROM pg_tables WHERE schemaname = 'public';`).
+   Entries for other roles (for example `supabase_admin`) are recorded, not
+   changed.
+7. Smoke tests and proxy check (§5), with phase 1 OpenAI settings.
+8. `pg_stat_activity` shows at most `DATABASE_POOL_MAX` backend connections per
+   instance, also during a redeploy.
+9. Latency from Render Frankfurt to `eu-west-1` for `POST /generation/start`
+   (several round trips per request).
+
+### 11.8 Rollback
+
+- Application: suspend the staging service or redeploy an earlier staging
+  commit. Production (`main`, `sketchit-backend-plov`) is never involved.
+- A commit without `002_restrict_data_api_access` refuses to start against a
+  database where it was applied ("Database has migration … not present in this
+  build"). To go back that far, reset the staging tables first.
+- Reset of the backend tables, only in the staging project, after confirming
+  the project reference in the dashboard:
+  `DROP TABLE generations, daily_usage, auth_tokens, users, schema_migrations;`
+  This deletes all staging accounts and images; the next start migrates again.
+- Do not disable row level security as a rollback step; it would expose the
+  tables through the Data API.
+- Full teardown: §9.
